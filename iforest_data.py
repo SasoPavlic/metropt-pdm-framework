@@ -13,8 +13,6 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
 
 
 def convert_wsl_to_windows_path(path: str) -> str:
@@ -116,41 +114,6 @@ def build_rolling_features(
     agg = agg.ffill().bfill()
     return agg
 
-
-def build_plot_pca_feature(
-    df_num: pd.DataFrame,
-    n_components: int = 1,
-    component_index: int = 1,
-    feature_name: str = "plot_pca_component",
-    random_state: int = 42
-) -> Tuple[pd.Series, dict]:
-    """
-    Project all numeric features to a single PCA component for timeline plotting.
-    Returns the component series aligned to df_num.index and metadata about the projection.
-    """
-    if df_num is None or df_num.shape[0] == 0:
-        raise ValueError("Cannot build PCA plot feature from an empty DataFrame.")
-    num_only = df_num.select_dtypes(include=[np.number])
-    if num_only.shape[1] == 0:
-        raise ValueError("No numeric columns available for PCA plot feature.")
-    clean = num_only.replace([np.inf, -np.inf], np.nan)
-    clean = clean.ffill().bfill().fillna(0.0)
-
-    scaler = StandardScaler()
-    scaled = scaler.fit_transform(clean.values)
-
-    max_comp = max(1, min(n_components, scaled.shape[1]))
-    pca = PCA(n_components=max_comp, random_state=random_state)
-    comps = pca.fit_transform(scaled)
-
-    comp_idx = max(1, min(component_index, pca.n_components_)) - 1
-    comp_series = pd.Series(comps[:, comp_idx], index=clean.index, name=feature_name)
-    info = {
-        "n_components": int(pca.n_components_),
-        "component_index": int(comp_idx + 1),
-        "explained_variance_ratio": [float(v) for v in pca.explained_variance_ratio_],
-    }
-    return comp_series, info
 
 
 def parse_maintenance_windows(

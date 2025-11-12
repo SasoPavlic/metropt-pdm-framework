@@ -20,7 +20,6 @@ import numpy as np
 import pandas as pd
 
 from iforest_data import (
-    build_plot_pca_feature,
     build_operation_phase,
     build_rolling_features,
     load_csv,
@@ -31,7 +30,7 @@ from iforest_data import (
 )
 from iforest_metrics import confusion_and_scores, evaluate_risk_thresholds, window_mask
 from iforest_model import train_iforest_and_score
-from iforest_plotting import prepare_plot_frame, plot_raw_timeline
+from iforest_plotting import plot_raw_timeline
 
 
 def parse_risk_grid_spec(spec: str) -> List[float]:
@@ -68,14 +67,6 @@ TRAIN_FRAC: float = 0.33
 MAX_BASE_FEATURES: int = 12
 # Exclude near-binary numeric columns from features to focus on informative signals.
 EXCLUDE_QUASI_BINARY: bool = True
-# PCA components computed for plotting (training always uses the full feature set).
-PCA_COMPONENTS: int = 8
-# Whether to project all features to a PCA component for visualization.
-USE_PCA_FOR_PLOTTING: bool = True
-# 1-based index of the PCA component to show on the timeline when PCA plotting is enabled.
-PLOT_PCA_COMPONENT_INDEX: int = 1
-# Column name used to store the PCA-derived plot feature.
-PLOT_PCA_FEATURE_NAME: str = "plot_pca_component"
 # Hours before maintenance start considered pre-maintenance (operation_phase=1).
 PRE_MAINTENANCE_HOURS: int = 2
 # Rolling risk default window (minutes).
@@ -86,14 +77,6 @@ DEFAULT_RISK_GRID: str = "0.05:0.6:0.01"
 EARLY_WARNING_MINUTES: int = 120
 # Exponential low-pass filter alpha for anomaly scores; 0 disables smoothing.
 LPF_ALPHA: float = 0
-# Name of the column to plot as context; None chooses the first numeric column.
-PLOT_FEATURE: Optional[str] = "DV_pressure"
-# Plot every Nth point to reduce density; 1 means no thinning.
-PLOT_STRIDE: int = 100
-# Optional rolling median rule for the plotted Y only (e.g., '60s'); None disables.
-PLOT_ROLLING: Optional[str] = None
-# Short windows (minutes) threshold: windows with duration <= this are drawn as vertical lines.
-SHORT_WINDOW_MINUTES: float = 100.0
 # Show labels for maintenance windows (IDs/severity) on the plot.
 SHOW_WINDOW_LABELS: bool = True
 # Font size for maintenance window labels.
@@ -205,52 +188,7 @@ def main() -> None:
     ).rename("maintenance_risk")
     pred["maintenance_risk"] = maintenance_risk
 
-    # 6) Align predictions back to ORIGINAL (raw) time index
-    plot_feature_name = PLOT_FEATURE
-    plot_pca_meta: Optional[dict] = None
-    raw_num = df_raw.select_dtypes(include=[np.number])
-    if PLOT_FEATURE and PLOT_FEATURE in df_raw.columns and PLOT_FEATURE not in raw_num.columns:
-        raw_num = raw_num.join(df_raw[[PLOT_FEATURE]], how="left")
-    raw_reindexed = raw_num.reindex(pred.index)
-
-    if USE_PCA_FOR_PLOTTING:
-        try:
-            n_comp_for_plot = PCA_COMPONENTS if PCA_COMPONENTS and PCA_COMPONENTS > 0 else 1
-            plot_pca_series, plot_pca_meta = build_plot_pca_feature(
-                df_num=X,
-                n_components=n_comp_for_plot,
-                component_index=PLOT_PCA_COMPONENT_INDEX,
-                feature_name=PLOT_PCA_FEATURE_NAME,
-            )
-            raw_reindexed[plot_pca_series.name] = plot_pca_series.reindex(raw_reindexed.index)
-            plot_feature_name = plot_pca_series.name
-        except Exception as exc:
-            plot_pca_meta = None
-            print(f"[WARN] Plot PCA feature generation failed ({exc}); falling back to configured plot feature.")
-    if plot_pca_meta:
-        comp_idx = plot_pca_meta.get("component_index", 1)
-        ratios = plot_pca_meta.get("explained_variance_ratio", [])
-        ratio_val = ratios[comp_idx - 1] if 0 <= comp_idx - 1 < len(ratios) else None
-        if ratio_val is not None:
-            print(
-                f"[INFO] Plot PCA component #{comp_idx} derived from {plot_pca_meta.get('n_components')} total components "
-                f"(explained variance ratio={ratio_val:.4f})."
-            )
-        else:
-            print(
-                f"[INFO] Plot PCA component #{comp_idx} derived from {plot_pca_meta.get('n_components')} total components."
-            )
-
-    if not plot_feature_name or plot_feature_name not in raw_reindexed.columns:
-        fallback_cols = raw_reindexed.select_dtypes(include=[np.number]).columns.tolist()
-        if not fallback_cols:
-            raise ValueError("No numeric column available for plotting after alignment.")
-        fallback_name = fallback_cols[0]
-        if plot_feature_name:
-            print(f"[WARN] Plot feature '{plot_feature_name}' unavailable after alignment; using '{fallback_name}' instead.")
-        plot_feature_name = fallback_name
-
-    # 7) Maintenance windows + operation phase feature
+    # 6) Maintenance windows + operation phase feature
     maint_windows = parse_maintenance_windows(
         windows=None,
         maintenance_csv=None,
@@ -264,9 +202,6 @@ def main() -> None:
     )
     operation_phase = operation_phase.astype(np.int8)
     pred["operation_phase"] = operation_phase
-    extra_features = pd.concat([operation_phase, maintenance_risk], axis=1)
-    raw_reindexed = raw_reindexed.join(extra_features, how="left")
-
     # Event-level evaluation of maintenance_risk thresholds
     risk_thresholds: List[float] = []
     risk_alarm_mask: Optional[pd.Series] = None
@@ -299,14 +234,8 @@ def main() -> None:
             best_risk_threshold = float(best["threshold"])
             risk_alarm_mask = (maintenance_risk >= best_risk_threshold).astype(bool)
 
-    # 8) Prepare & plot
-    df_plot = prepare_plot_frame(
-        raw_df=raw_reindexed,
-        pred_df=pred,
-        feature_to_plot=plot_feature_name,
-        plot_stride=PLOT_STRIDE,
-        plot_rolling=PLOT_ROLLING,
-    )
+    # 7b) Minimal frame for plotting (contains maintenance_risk timeline)
+    df_plot = pred[["maintenance_risk"]].copy()
 
     # Exact training cutoff timestamp on the prediction index
     train_cutoff_ts = None

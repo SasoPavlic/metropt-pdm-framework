@@ -10,50 +10,8 @@ from typing import List, Optional, Tuple
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
 from matplotlib.patches import Patch
-
-
-def prepare_plot_frame(
-    raw_df: pd.DataFrame,
-    pred_df: pd.DataFrame,
-    feature_to_plot: Optional[str],
-    plot_stride: int,
-    plot_rolling: Optional[str]
-) -> pd.DataFrame:
-    # Avoid double-join if predictions already merged
-    if {"is_anomaly", "anom_score"}.issubset(set(raw_df.columns)):
-        df = raw_df.copy()
-    else:
-        pred_join = pred_df
-        overlap = [c for c in pred_join.columns if c in raw_df.columns]
-        if overlap:
-            pred_join = pred_join.drop(columns=overlap)
-        df = raw_df.join(pred_join, how="inner")
-
-    if feature_to_plot and feature_to_plot in raw_df.columns:
-        df["y_plot"] = raw_df[feature_to_plot]
-    else:
-        numeric_cols = raw_df.select_dtypes(include=[np.number]).columns.tolist()
-        if not numeric_cols:
-            raise ValueError("No numeric column available for plotting.")
-        df["y_plot"] = raw_df[numeric_cols[0]]
-
-    if plot_rolling:
-        df["y_plot"] = df["y_plot"].rolling(plot_rolling, min_periods=1).median()
-
-    if plot_stride and plot_stride > 1:
-        df = df.iloc[::plot_stride].copy()
-
-    keep = ["y_plot", "is_anomaly"]
-    if "anom_score_lpf" in df.columns:
-        keep.append("anom_score_lpf")
-    if "operation_phase" in df.columns:
-        keep.append("operation_phase")
-    if "maintenance_risk" in df.columns:
-        keep.append("maintenance_risk")
-    return df[keep]
 
 
 def plot_raw_timeline(
@@ -86,9 +44,10 @@ def plot_raw_timeline(
         1,
         where=~state.values,
         color="#2E7D32",
-        alpha=0.2,
+        alpha=0.18,
         step="post",
         label="Normal",
+        zorder=1,
     )
     risk_label = "Risk alarm"
     if risk_threshold is not None:
@@ -99,9 +58,10 @@ def plot_raw_timeline(
         1,
         where=state.values,
         color="#C62828",
-        alpha=0.55,
+        alpha=0.5,
         step="post",
         label=risk_label,
+        zorder=2,
     )
 
     # Training cutoff
@@ -122,7 +82,7 @@ def plot_raw_timeline(
 
     # Visualize maintenance windows + early-warning lead
     span_drawn = False
-    warn_drawn = False
+    # Lead windows removed; no warn shading drawn
     horizon = pd.to_timedelta(float(max(0.0, early_warning_minutes)), unit="m")
 
     # Label placement lanes
@@ -152,17 +112,11 @@ def plot_raw_timeline(
 
         dur_min_real = max(0.0, (e - s).total_seconds() / 60.0)
 
-        ax.axvspan(s_clip, e_clip, color="#FFC107", alpha=0.25, lw=0)
+        ax.axvspan(s_clip, e_clip, color="#FFC107", alpha=0.35, lw=0, zorder=3)
         span_drawn = True
         x_for_label = s_clip + (e_clip - s_clip) / 2
 
-        if horizon > pd.Timedelta(0):
-            warn_start = s - horizon
-            warn_start = max(warn_start, xmin) if xmin is not None else warn_start
-            ax.axvspan(warn_start, s, color="#90CAF9", alpha=0.18, lw=0)
-            ax.axvline(warn_start, color="#0288D1", linestyle="--", linewidth=1.2)
-            ax.axvline(s, color="#0288D1", linestyle="--", linewidth=1.2)
-            warn_drawn = True
+        # Lead windows omitted for clarity
 
         if show_window_labels:
             try:
@@ -199,12 +153,7 @@ def plot_raw_timeline(
     if span_drawn:
         handles.append(Patch(facecolor="#FFC107", alpha=0.25, label="Failure window"))
         labels.append("Failure window")
-    if warn_drawn:
-        from matplotlib.lines import Line2D
-        handles.append(Line2D([0], [0], color="#0288D1", linestyle="--", lw=1.2, label="Early-warning horizon"))
-        labels.append("Early-warning horizon")
-        handles.append(Patch(facecolor="#90CAF9", alpha=0.18, label="Lead window"))
-        labels.append("Lead window")
+    # Lead window legend removed as spans are not drawn
     ax.legend(handles, labels, loc="best")
 
     ax.set_xlabel("Time")
@@ -217,4 +166,3 @@ def plot_raw_timeline(
     fig.tight_layout()
     if save_fig:
         fig.savefig(save_fig, dpi=160, bbox_inches="tight")
-    plt.show()

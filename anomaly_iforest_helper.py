@@ -63,7 +63,7 @@ PRE_DOWNSAMPLE_RULE: Optional[str] = None
 # Rolling window for feature aggregation (e.g., '600s' = 10 minutes).
 ROLLING_WINDOW: str = "600s"
 # Fraction of earliest data used to train the IsolationForest.
-TRAIN_FRAC: float = 0.20
+TRAIN_FRAC: float = 0.33
 # Limit of most-variable base numeric features to keep before rolling aggregation.
 MAX_BASE_FEATURES: int = 12
 # Exclude near-binary numeric columns from features to focus on informative signals.

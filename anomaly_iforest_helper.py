@@ -66,10 +66,9 @@ SAVE_FEATURES_CSV_PATH: Optional[str] = "metropt3_iforest_features.csv"
 
 # Experiment mode:
 # - "single": one global model trained once on an early slice.
-# - "daily": per-day adaptive models trained on all history up to the previous day.
-# - "per_maint": per-inter-maintenance models trained on accumulated normal data
-#   up to the end of the previous maintenance window.
-EXPERIMENT_MODE: str = "single"
+# - "per_maint": per-maintenance models trained on fixed post-maintenance
+#   training days for each cycle (plus an initial pre-W1 model).
+EXPERIMENT_MODE: str = "per_maint"
 
 # Optional time-based pre-downsampling rule (e.g., '60s') to regularize cadence before feature building; None disables.
 PRE_DOWNSAMPLE_RULE: Optional[str] = None
@@ -86,11 +85,18 @@ EXCLUDE_QUASI_BINARY: bool = False
 # Exponential low-pass filter alpha for anomaly scores; 0 disables smoothing.
 LPF_ALPHA: float = 0.4
 # Rolling risk window (minutes).
-RISK_WINDOW_MINUTES: int = 1920
+RISK_WINDOW_MINUTES: int = 480
 # Risk evaluation grid specification (start:stop:step).
 RISK_EVAL_GRID_SPEC: str = "0.05:0.6:0.01"
 # Early-warning horizon for risk evaluation (minutes).
 EARLY_WARNING_MINUTES: int = 120
+# Length of the post-maintenance training interval (in minutes) for the
+# per-maintenance regime. For each maintenance window W_j, the next model
+# (if any) is trained on the interval [end_j, end_j + POST_MAINT_TRAIN_MINUTES),
+# clipped so it does not intrude into the next maintenance window. The same
+# time mask is excluded from point-wise evaluation in the single-model regime
+# for fair comparison.
+POST_MAINT_TRAIN_MINUTES: int = 1000
 
 # --- Maintenance context / plotting ---
 # Hours before maintenance start considered pre-maintenance (operation_phase=1).
@@ -183,6 +189,43 @@ def _build_features_and_context() -> Tuple[pd.DataFrame, List[Tuple], pd.Series]
     return X, maint_windows, operation_phase
 
 
+def _build_post_maintenance_train_mask(
+    index: pd.DatetimeIndex,
+    maint_windows: List[Tuple],
+    train_minutes: int,
+) -> pd.Series:
+    """
+    Build a boolean mask marking post-maintenance training intervals.
+
+    For each maintenance window W_j with end time e_j, we mark the interval
+    [e_j, e_j + train_minutes) as training-only, clipped so that it does not
+    intrude into the next maintenance window. This mask is used to exclude
+    post-maintenance training time from point-wise evaluation in the
+    single-model regime. The per-maintenance regime may further refine which
+    parts of these intervals are actually used for training when gaps are very
+    short.
+    """
+    mask = pd.Series(False, index=index)
+    if not maint_windows or train_minutes <= 0:
+        return mask
+
+    mw_sorted = sorted(maint_windows, key=lambda w: pd.to_datetime(w[0]))
+    starts = [pd.to_datetime(w[0]) for w in mw_sorted]
+    ends = [pd.to_datetime(w[1]) for w in mw_sorted]
+
+    for j, end_ts in enumerate(ends):
+        t_start = pd.to_datetime(end_ts)
+        t_stop = t_start + pd.Timedelta(minutes=float(train_minutes))
+        if j < len(starts) - 1:
+            next_start = pd.to_datetime(starts[j + 1])
+            if t_stop > next_start:
+                t_stop = next_start
+        slice_mask = (index >= t_start) & (index < t_stop)
+        mask |= slice_mask
+
+    return mask
+
+
 def _compute_pointwise_metrics(
     is_anomaly: pd.Series,
     operation_phase: pd.Series,
@@ -249,6 +292,34 @@ def _evaluate_risk_series(
                 f"Recall={best['recall']:.4f}  F1={best['f1']:.4f}  "
                 f"TP={best['tp']}  FP={best['fp']}  FN={best['fn']}"
             )
+            # Diagnostics: for each failure window, show max risk inside the
+            # early-warning horizon. This helps understand why TP may be zero.
+            try:
+                horizon = pd.to_timedelta(float(max(0.0, EARLY_WARNING_MINUTES)), unit="m")
+                windows: List[Tuple[pd.Timestamp, pd.Timestamp]] = []
+                for w in maint_windows or []:
+                    if len(w) < 2:
+                        continue
+                    s = pd.to_datetime(w[0])
+                    e = pd.to_datetime(w[1])
+                    if pd.isna(s) or pd.isna(e) or e < s:
+                        continue
+                    windows.append((s, e))
+                if windows:
+                    print(f"[{tag}] Per-window max risk within early-warning horizon:")
+                    for idx, (s, e) in enumerate(windows, start=1):
+                        ew_start = s - horizon
+                        rslice = maintenance_risk.loc[ew_start:e]
+                        if rslice.empty:
+                            print(f"[{tag}]   window #{idx}: no risk data in horizon")
+                        else:
+                            max_val = float(rslice.max())
+                            t_max = rslice.idxmax()
+                            print(
+                                f"[{tag}]   window #{idx}: max_risk={max_val:.4f} at {t_max}"
+                            )
+            except Exception as exc:
+                print(f"[WARN] Risk diagnostics failed for tag {tag!r}: {exc}")
             best_risk_threshold = float(best["threshold"])
             risk_alarm_mask = (maintenance_risk >= best_risk_threshold).astype(bool)
     else:
@@ -295,6 +366,21 @@ def _run_single_model_experiment(
     pred["maintenance_risk"] = maintenance_risk
     pred["operation_phase"] = operation_phase.reindex(pred.index).astype(np.int8)
 
+    # Training-only rows used in any regime:
+    # - the initial chronological TRAIN_FRAC slice (same as train_iforest_and_score)
+    # - fixed post-maintenance training intervals for per-maint models
+    n_total = len(pred.index)
+    n_train_single = max(30, int(n_total * TRAIN_FRAC))
+    n_train_single = min(n_train_single, n_total)
+    initial_train_mask = pd.Series(False, index=pred.index)
+    if n_train_single > 0:
+        initial_train_mask.iloc[:n_train_single] = True
+
+    post_maint_train_mask = _build_post_maintenance_train_mask(
+        pred.index, maint_windows, POST_MAINT_TRAIN_MINUTES
+    )
+    eval_exclude_mask = initial_train_mask | post_maint_train_mask
+
     # Event-level evaluation of maintenance_risk thresholds
     best_risk_threshold, risk_alarm_mask, _ = _evaluate_risk_series(
         maintenance_risk, maint_windows, tag="RISK"
@@ -308,8 +394,11 @@ def _run_single_model_experiment(
     except Exception:
         train_cutoff_ts = None
 
-    # Point-wise metrics on normal + pre-maintenance
-    m_all = _compute_pointwise_metrics(pred["is_anomaly"], pred["operation_phase"])
+    # Point-wise metrics on normal + pre-maintenance, excluding training-only rows
+    eval_mask = ~eval_exclude_mask
+    m_all = _compute_pointwise_metrics(
+        pred["is_anomaly"], pred["operation_phase"], eval_mask=eval_mask
+    )
     print("[METRIC] Single-model (all evaluated rows):")
     print(
         f"         TP={m_all['TP']}  FP={m_all['FP']}  FN={m_all['FN']}  TN={m_all['TN']}"
@@ -333,121 +422,6 @@ def _run_single_model_experiment(
     return pred, info, train_cutoff_ts, best_risk_threshold, risk_alarm_mask
 
 
-def _run_daily_models_experiment(
-    X: pd.DataFrame,
-    maint_windows: List[Tuple],
-    operation_phase: pd.Series,
-) -> Tuple[pd.DataFrame, dict, Optional[float], Optional[pd.Series]]:
-    """
-    Adaptive regime: train a new IF model for each calendar day, using all data
-    up to the previous day as training, and evaluate day-by-day.
-    """
-    index = X.index
-    day_periods = index.to_period("D")
-    unique_days = day_periods.unique().sort_values()
-    if len(unique_days) < 2:
-        raise ValueError("Daily-mode requires at least two calendar days of data.")
-
-    pred = pd.DataFrame(index=index)
-    exceedance = pd.Series(index=index, dtype=float)
-
-    daily_infos: List[dict] = []
-
-    # First day is used only as training history; daily evaluation starts at second day.
-    n_test_days = len(unique_days) - 1
-    print(
-        f"[INFO] Daily mode: {n_test_days} test days "
-        f"(skipping initial training-only day {unique_days[0]})"
-    )
-
-    for day_idx, day in enumerate(unique_days[1:], start=1):
-        train_mask = day_periods < day
-        test_mask = day_periods == day
-        if not train_mask.any() or not test_mask.any():
-            continue
-
-        X_train = X.loc[train_mask]
-        X_test = X.loc[test_mask]
-
-        print(
-            f"[INFO] Daily model {day_idx}/{n_test_days} for day {day}: "
-            f"train_size={X_train.shape[0]}, test_size={X_test.shape[0]}"
-        )
-
-        # Train on all history up to previous day, score only current day.
-        slice_pred, info = train_iforest_on_slices(
-            X_train=X_train,
-            X_all=X_test,
-            lpf_alpha=LPF_ALPHA,
-            random_state=42,
-        )
-        daily_infos.append({"day": str(day), **info})
-
-        pred.loc[test_mask, "anom_score"] = slice_pred["anom_score"]
-        if "anom_score_lpf" in slice_pred.columns:
-            pred.loc[test_mask, "anom_score_lpf"] = slice_pred["anom_score_lpf"]
-        pred.loc[test_mask, "is_anomaly"] = slice_pred["is_anomaly"]
-
-        score_for_risk = (
-            slice_pred["anom_score_lpf"]
-            if "anom_score_lpf" in slice_pred.columns
-            else slice_pred["anom_score"]
-        ).astype(float).fillna(0.0)
-        tau = info.get("threshold")
-        if tau is None:
-            q3 = info.get("q3")
-            iqr = info.get("iqr")
-            if q3 is not None and iqr is not None:
-                tau = float(q3 + 3.0 * iqr)
-            else:
-                finite = score_for_risk.to_numpy()
-                finite = finite[np.isfinite(finite)]
-                tau = float(np.percentile(finite, 75)) if finite.size else 0.0
-        exceedance_slice = (score_for_risk >= float(tau)).astype(float)
-        exceedance.loc[test_mask] = exceedance_slice
-
-    # Any points with no exceedance value (e.g., initial training-only days) are treated as zero risk.
-    exceedance = exceedance.fillna(0.0)
-    maintenance_risk = (
-        exceedance.rolling(f"{RISK_WINDOW_MINUTES}min", min_periods=1)
-        .mean()
-        .astype(np.float32)
-        .fillna(0.0)
-    ).rename("maintenance_risk")
-    pred["maintenance_risk"] = maintenance_risk
-    pred["operation_phase"] = operation_phase.reindex(pred.index).astype(np.int8)
-
-    # Event-level evaluation of maintenance_risk thresholds
-    best_risk_threshold, risk_alarm_mask, _ = _evaluate_risk_series(
-        maintenance_risk, maint_windows, tag="RISK-DAILY"
-    )
-
-    # Point-wise metrics on days with predictions (normal + pre-maintenance only)
-    eval_mask = pred["is_anomaly"].notna()
-    m_all = _compute_pointwise_metrics(pred["is_anomaly"], pred["operation_phase"], eval_mask=eval_mask)
-    print("[METRIC] Daily-model (all evaluated rows across days):")
-    print(
-        f"         TP={m_all['TP']}  FP={m_all['FP']}  FN={m_all['FN']}  TN={m_all['TN']}"
-    )
-    print(
-        f"         Precision={m_all['precision']:.4f}  Recall={m_all['recall']:.4f}  "
-        f"F1={m_all['f1']:.4f}  Accuracy={m_all['accuracy']:.4f}"
-    )
-
-    # Summary of daily training sizes
-    if daily_infos:
-        n_days = len(daily_infos)
-        min_train = min(info["n_train"] for info in daily_infos)
-        max_train = max(info["n_train"] for info in daily_infos)
-        print(
-            f"[INFO] Daily models: {n_days} test days, training size range={min_train}..{max_train}"
-        )
-
-    summary_info = {
-        "mode": "daily",
-        "n_days": len(daily_infos),
-    }
-    return pred, summary_info, best_risk_threshold, risk_alarm_mask
 
 
 def _run_per_maintenance_experiment(
@@ -456,15 +430,21 @@ def _run_per_maintenance_experiment(
     operation_phase: pd.Series,
 ) -> Tuple[pd.DataFrame, dict, Optional[float], Optional[pd.Series]]:
     """
-    Adaptive regime by inter-maintenance period:
+    Adaptive regime by maintenance cycles.
 
-    - Define periods between consecutive maintenance windows (plus the initial
-      period before the first and the final period after the last).
-    - For period P_j (after maintenance window W_j), train on all historical
-      rows with operation_phase==0 (normal) and timestamps up to the end of W_j.
-    - For the initial period (before W1), train on normal rows strictly before
-      the first maintenance start.
-    - Evaluate on each period's rows, then aggregate metrics across periods.
+    - Model 0 (pre-W1) is trained on the same earliest TRAIN_FRAC fraction of
+      the timeline as the single-model regime (chronological order), but with
+      maintenance rows (operation_phase==2) excluded from the training set.
+    - After each maintenance window W_j, we reserve a fixed amount of time
+      immediately after the window (POST_MAINT_TRAIN_MINUTES) as a
+      training-only interval for the *next* model, provided the gap to the
+      next maintenance is long enough.
+    - That model is then used to score the remaining time until the next
+      maintenance. If the gap is shorter than POST_MAINT_TRAIN_MINUTES, no
+      new model is trained and the previous model is reused to score the gap.
+    - All training-only intervals (initial TRAIN_FRAC slice and
+      post-maintenance training intervals) are excluded from point-wise
+      evaluation in all regimes.
     """
     if not maint_windows:
         raise ValueError("Per-maintenance mode requires maintenance windows.")
@@ -475,59 +455,52 @@ def _run_per_maintenance_experiment(
     ends = [pd.to_datetime(w[1]) for w in mw_sorted]
 
     index = X.index
-    data_start = pd.to_datetime(index.min())
-    data_end = pd.to_datetime(index.max())
+    op_phase = operation_phase.reindex(index).astype(np.int8)
+    if index.empty:
+        raise ValueError("Empty index in per-maintenance experiment.")
 
-    # Build inter-maintenance periods P0..Pk
-    periods: List[Tuple[pd.Timestamp, pd.Timestamp, int]] = []
-    # P0: start of data to start(W1)
-    periods.append((data_start, starts[0], 0))
-    # Intermediate periods: end(Wj) to start(Wj+1)
-    for j in range(len(mw_sorted) - 1):
-        periods.append((ends[j], starts[j + 1], j + 1))
-    # Final period: end(last W) to end of data
-    periods.append((ends[-1], data_end, len(mw_sorted)))
+    # Initial training slice (shared with the single-model regime)
+    n_total = len(index)
+    n_train_initial = max(30, int(n_total * TRAIN_FRAC))
+    n_train_initial = min(n_train_initial, n_total)
+    initial_train_order_mask = pd.Series(False, index=index)
+    if n_train_initial > 0:
+        initial_train_order_mask.iloc[:n_train_initial] = True
+    # For regime 2 we only exclude maintenance rows from training.
+    initial_train_mask = initial_train_order_mask & (op_phase != 2)
+
+    # Post-maintenance training schedule (time-based) and global training-only mask
+    post_maint_train_mask = _build_post_maintenance_train_mask(
+        index, mw_sorted, POST_MAINT_TRAIN_MINUTES
+    )
+    global_train_for_eval = initial_train_order_mask | post_maint_train_mask
 
     pred = pd.DataFrame(index=index)
     exceedance = pd.Series(index=index, dtype=float)
 
     period_infos: List[dict] = []
 
-    n_periods = len(periods)
-    print(f"[INFO] Per-maint mode: {n_periods} inter-maintenance periods")
+    print(
+        f"[INFO] Per-maint mode: {len(mw_sorted) + 1} logical cycles "
+        f"(pre-W1 plus one cycle per maintenance window)"
+    )
 
-    # Precompute operation_phase aligned to X
-    op_phase = operation_phase.reindex(index).astype(np.int8)
+    # Helper: fit IF on X_train and score X_test; update pred/exceedance.
+    def _fit_and_score_segment(
+        seg_label: str, train_mask: pd.Series, test_mask: pd.Series
+    ) -> Optional[dict]:
+        nonlocal pred, exceedance
 
-    for p_idx, (p_start, p_end, w_idx) in enumerate(periods):
-        # Test mask: rows in this inter-maintenance period
-        if w_idx == len(mw_sorted):
-            # Last period includes end boundary
-            test_mask = (index >= p_start) & (index <= p_end)
-        else:
-            test_mask = (index >= p_start) & (index < p_end)
         if not test_mask.any():
-            continue
-
-        # Training mask: accumulated normal history up to end of previous window
-        if w_idx == 0:
-            # For P0 (before first maintenance), train on normal rows before W1 start
-            train_cutoff = starts[0]
-            train_mask = (index < train_cutoff) & (op_phase == 0)
-        else:
-            # For P_j (after W_j), train on normal rows up to end(W_j)
-            train_cutoff = ends[w_idx - 1]
-            train_mask = (index <= train_cutoff) & (op_phase == 0)
-
-        if not train_mask.any():
-            continue
+            return None
 
         X_train = X.loc[train_mask]
         X_test = X.loc[test_mask]
+        if X_train.shape[0] < 2 or X_test.shape[0] < 2:
+            return None
 
         print(
-            f"[INFO] Per-maint model {p_idx + 1}/{n_periods} "
-            f"for period {p_start} → {p_end}: "
+            f"[INFO] Per-maint segment {seg_label}: "
             f"train_size={X_train.shape[0]}, test_size={X_test.shape[0]}"
         )
 
@@ -536,13 +509,6 @@ def _run_per_maintenance_experiment(
             X_all=X_test,
             lpf_alpha=LPF_ALPHA,
             random_state=42,
-        )
-        period_infos.append(
-            {
-                "period_index": p_idx,
-                "train_size": info["n_train"],
-                "test_size": X_test.shape[0],
-            }
         )
 
         pred.loc[test_mask, "anom_score"] = slice_pred["anom_score"]
@@ -567,6 +533,72 @@ def _run_per_maintenance_experiment(
                 tau = float(np.percentile(finite, 75)) if finite.size else 0.0
         exceedance_slice = (score_for_risk >= float(tau)).astype(float)
         exceedance.loc[test_mask] = exceedance_slice
+
+        return {
+            "segment": seg_label,
+            "train_size": info["n_train"],
+            "test_size": X_test.shape[0],
+        }
+
+    # Model 0: pre-W1 region, trained on the initial TRAIN_FRAC slice.
+    first_start = starts[0]
+    pre_w1_test_mask = (index < first_start) & (~initial_train_order_mask)
+    current_train_mask = initial_train_mask
+
+    seg_info = _fit_and_score_segment("pre_W1", current_train_mask, pre_w1_test_mask)
+    if seg_info:
+        period_infos.append(seg_info)
+
+    # Iterate over maintenance windows; after each, either train a new model on
+    # its post-maintenance training interval or reuse the previous model for
+    # short gaps.
+    data_start = index.min()
+    data_end = index.max()
+
+    for j, end_ts in enumerate(ends):
+        gap_start = pd.to_datetime(end_ts)
+        if j < len(starts) - 1:
+            gap_end = pd.to_datetime(starts[j + 1])
+        else:
+            gap_end = data_end
+
+        # Gap between end of this maintenance and the next maintenance (or end of data)
+        if gap_end <= gap_start:
+            print(f"[INFO] No gap after maint #{j + 1} (gap_end <= gap_start).")
+            continue
+
+        gap_minutes = (gap_end - gap_start).total_seconds() / 60.0
+        gap_mask = (index > gap_start) & (index < gap_end if j < len(starts) - 1 else index <= gap_end)
+        if not gap_mask.any():
+            print(f"[INFO] No candidate points after maint #{j + 1} (gap has no data).")
+            continue
+
+        if POST_MAINT_TRAIN_MINUTES <= 0 or gap_minutes <= POST_MAINT_TRAIN_MINUTES:
+            # Gap too short for a dedicated training block: reuse the previous model.
+            seg_label = f"gap_after_maint_{j + 1}"
+            seg_info = _fit_and_score_segment(seg_label, current_train_mask, gap_mask)
+            if seg_info:
+                period_infos.append(seg_info)
+            continue
+
+        # Enough gap to fit a new model: split into a training sub-interval and the remaining test interval.
+        train_end = gap_start + pd.Timedelta(minutes=float(POST_MAINT_TRAIN_MINUTES))
+        if train_end > gap_end:
+            train_end = gap_end
+
+        train_mask_new = (
+            (index > gap_start)
+            & (index <= train_end)
+            & (index <= gap_end)
+            & (op_phase != 2)
+        )
+        test_mask_new = (index > train_end) & (index < gap_end if j < len(starts) - 1 else index <= gap_end)
+
+        seg_label = f"after_maint_{j + 1}"
+        seg_info = _fit_and_score_segment(seg_label, train_mask_new, test_mask_new)
+        if seg_info:
+            period_infos.append(seg_info)
+            current_train_mask = train_mask_new
 
     # Any points with no exceedance value (e.g., unscored periods) are treated as zero risk.
     exceedance = exceedance.fillna(0.0)
@@ -584,8 +616,9 @@ def _run_per_maintenance_experiment(
         maintenance_risk, mw_sorted, tag="RISK-PERMAINT"
     )
 
-    # Point-wise metrics on rows with predictions (normal + pre-maintenance only)
-    eval_mask = pred["is_anomaly"].notna()
+    # Point-wise metrics on rows with predictions (normal + pre-maintenance only),
+    # excluding all training-only rows (initial slice + post-maint training days).
+    eval_mask = pred["is_anomaly"].notna() & (~global_train_for_eval)
     m_all = _compute_pointwise_metrics(
         pred["is_anomaly"], pred["operation_phase"], eval_mask=eval_mask
     )
@@ -603,13 +636,13 @@ def _run_per_maintenance_experiment(
         min_train = min(info["train_size"] for info in period_infos)
         max_train = max(info["train_size"] for info in period_infos)
         print(
-            f"[INFO] Per-maint models: {n_used} periods with models, "
+            f"[INFO] Per-maint models: {n_used} segments with models, "
             f"training size range={min_train}..{max_train}"
         )
 
     summary_info = {
         "mode": "per_maint",
-        "n_periods": len(period_infos),
+        "n_segments": len(period_infos),
     }
     return pred, summary_info, best_risk_threshold, risk_alarm_mask
 
@@ -620,21 +653,16 @@ def main() -> None:
 
     # 2) Run the selected experiment mode
     mode = EXPERIMENT_MODE.lower().strip()
-    if mode not in {"single", "daily", "per_maint"}:
+    if mode not in {"single", "per_maint"}:
         raise ValueError(
             f"Unsupported EXPERIMENT_MODE={EXPERIMENT_MODE!r}; "
-            f"use 'single', 'daily', or 'per_maint'."
+            f"use 'single' or 'per_maint'."
         )
 
     if mode == "single":
         pred, info, train_cutoff_ts, best_risk_threshold, risk_alarm_mask = _run_single_model_experiment(
             X, maint_windows, operation_phase
         )
-    elif mode == "daily":
-        pred, info, best_risk_threshold, risk_alarm_mask = _run_daily_models_experiment(
-            X, maint_windows, operation_phase
-        )
-        train_cutoff_ts = None
     else:
         pred, info, best_risk_threshold, risk_alarm_mask = _run_per_maintenance_experiment(
             X, maint_windows, operation_phase

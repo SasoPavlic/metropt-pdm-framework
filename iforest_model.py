@@ -123,7 +123,10 @@ def _time_based_train_mask(index: pd.Index, train_minutes: float, min_rows: int 
     try:
         start = pd.to_datetime(index.min())
         cutoff = start + pd.Timedelta(minutes=float(train_minutes))
-        mask = (pd.to_datetime(index) >= start) & (pd.to_datetime(index) <= cutoff)
+        mask = pd.Series(
+            (pd.to_datetime(index) >= start) & (pd.to_datetime(index) <= cutoff),
+            index=index,
+        )
     except Exception:
         mask = pd.Series(False, index=index)
     if mask.sum() < 2:

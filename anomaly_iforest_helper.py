@@ -336,10 +336,18 @@ def _run_single_model_experiment(
     operation_phase: pd.Series,
 ) -> Tuple[pd.DataFrame, dict, Optional[pd.Timestamp], Optional[float], Optional[pd.Series]]:
     """Baseline: single global IF model trained once and scored over the full timeline."""
-    pred_if, info = train_iforest_and_score(
-        X=X,
-        train_minutes=TRAIN_FRAC,
+    # Time-based training window, restricted to non-maintenance rows (phases 0/1)
+    train_time_mask = _time_based_train_mask(X.index, TRAIN_FRAC)
+    op_phase = operation_phase.reindex(X.index).astype(np.int8)
+    train_mask = train_time_mask & (op_phase != 2)
+    if train_mask.sum() < 2:
+        raise ValueError("Single-model training set has fewer than 2 samples after filtering.")
+
+    pred_if, info = train_iforest_on_slices(
+        X_train=X.loc[train_mask],
+        X_all=X,
         lpf_alpha=LPF_ALPHA,
+        random_state=42,
     )
 
     pred = pred_if.copy()
@@ -366,12 +374,12 @@ def _run_single_model_experiment(
         .fillna(0.0)
     ).rename("maintenance_risk")
     pred["maintenance_risk"] = maintenance_risk
-    pred["operation_phase"] = operation_phase.reindex(pred.index).astype(np.int8)
+    pred["operation_phase"] = op_phase
 
     # Training-only rows used in any regime:
-    # - the initial chronological TRAIN_FRAC minutes (same as train_iforest_and_score)
+    # - the initial chronological TRAIN_FRAC minutes
     # - fixed post-maintenance training intervals for per-maint models
-    initial_train_time_mask = _time_based_train_mask(pred.index, TRAIN_FRAC)
+    initial_train_time_mask = train_time_mask.reindex(pred.index).fillna(False)
     post_maint_train_mask = _build_post_maintenance_train_mask(
         pred.index, maint_windows, POST_MAINT_TRAIN_MINUTES
     )
@@ -385,8 +393,8 @@ def _run_single_model_experiment(
     # Exact training cutoff timestamp on the prediction index
     train_cutoff_ts: Optional[pd.Timestamp] = None
     try:
-        if info.get("n_train", 0) > 0 and info["n_train"] <= len(pred.index):
-            train_cutoff_ts = pred.index[info["n_train"] - 1]
+        if train_mask.any():
+            train_cutoff_ts = train_mask[train_mask].index.max()
     except Exception:
         train_cutoff_ts = None
 

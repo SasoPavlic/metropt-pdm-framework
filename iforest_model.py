@@ -111,23 +111,44 @@ def _train_iforest_core(
     return out, info
 
 
+def _time_based_train_mask(index: pd.Index, train_minutes: float, min_rows: int = 30) -> pd.Series:
+    """
+    Build a boolean mask selecting rows within the first `train_minutes` minutes
+    from the start of the index. Falls back to the first `min_rows` rows if the
+    time window contains too few points or if the index is not datetime-like.
+    """
+    mask = pd.Series(False, index=index)
+    if len(index) == 0 or train_minutes is None or train_minutes <= 0:
+        return mask
+    try:
+        start = pd.to_datetime(index.min())
+        cutoff = start + pd.Timedelta(minutes=float(train_minutes))
+        mask = (pd.to_datetime(index) >= start) & (pd.to_datetime(index) <= cutoff)
+    except Exception:
+        mask = pd.Series(False, index=index)
+    if mask.sum() < 2:
+        n_train = min(len(index), max(2, min_rows))
+        mask.iloc[:n_train] = True
+    return mask
+
+
 def train_iforest_and_score(
     X: pd.DataFrame,
-    train_frac: float = 0.10,
+    train_minutes: float = 1440.0,
     lpf_alpha: float = 0.0,
     random_state: int = 42,
 ) -> Tuple[pd.DataFrame, dict]:
     """
-    Backwards-compatible helper: train on the first train_frac of X and score all rows.
+    Train on the first `train_minutes` of X (chronological) and score all rows.
+    If the time window yields too few rows, fall back to the first `min_rows`.
     """
-    n = len(X)
-    if n < 2:
+    if len(X) < 2:
         raise ValueError("Need at least 2 samples to train IsolationForest.")
-    n_train = max(30, int(n * train_frac))
-    n_train = min(n_train, n)  # clamp in case of very small data
-    X_train = X.iloc[:n_train]
-    X_all = X
-    return _train_iforest_core(X_train, X_all, lpf_alpha=lpf_alpha, random_state=random_state)
+    train_mask = _time_based_train_mask(X.index, train_minutes=train_minutes)
+    X_train = X.loc[train_mask]
+    if X_train.shape[0] < 2:
+        raise ValueError("Time-based training selection produced fewer than 2 samples.")
+    return _train_iforest_core(X_train, X, lpf_alpha=lpf_alpha, random_state=random_state)
 
 
 def train_iforest_on_slices(

@@ -29,7 +29,7 @@ from iforest_data import (
     top_k_by_variance,
 )
 from iforest_metrics import confusion_and_scores, evaluate_risk_thresholds
-from iforest_model import train_iforest_and_score, train_iforest_on_slices
+from iforest_model import train_iforest_and_score, train_iforest_on_slices, _time_based_train_mask
 from iforest_plotting import plot_raw_timeline
 
 
@@ -75,7 +75,9 @@ PRE_DOWNSAMPLE_RULE: Optional[str] = None
 # Rolling window for feature aggregation (e.g., '600s' = 10 minutes).
 ROLLING_WINDOW: str = "60s"
 # Fraction of earliest data used to train the IsolationForest.
-TRAIN_FRAC: float = 0.03
+# Duration (minutes) of the initial training window (chronological from the start).
+# Previously this was a fraction; now it is interpreted as minutes.
+TRAIN_FRAC: float = 1440
 # Limit of most-variable base numeric features to keep before rolling aggregation.
 MAX_BASE_FEATURES: int = 12
 # Exclude near-binary numeric columns from features to focus on informative signals.
@@ -96,7 +98,7 @@ EARLY_WARNING_MINUTES: int = 120
 # clipped so it does not intrude into the next maintenance window. The same
 # time mask is excluded from point-wise evaluation in the single-model regime
 # for fair comparison.
-POST_MAINT_TRAIN_MINUTES: int = 1000
+POST_MAINT_TRAIN_MINUTES: int = 1440
 
 # --- Maintenance context / plotting ---
 # Hours before maintenance start considered pre-maintenance (operation_phase=1).
@@ -336,7 +338,7 @@ def _run_single_model_experiment(
     """Baseline: single global IF model trained once and scored over the full timeline."""
     pred_if, info = train_iforest_and_score(
         X=X,
-        train_frac=TRAIN_FRAC,
+        train_minutes=TRAIN_FRAC,
         lpf_alpha=LPF_ALPHA,
     )
 
@@ -367,19 +369,13 @@ def _run_single_model_experiment(
     pred["operation_phase"] = operation_phase.reindex(pred.index).astype(np.int8)
 
     # Training-only rows used in any regime:
-    # - the initial chronological TRAIN_FRAC slice (same as train_iforest_and_score)
+    # - the initial chronological TRAIN_FRAC minutes (same as train_iforest_and_score)
     # - fixed post-maintenance training intervals for per-maint models
-    n_total = len(pred.index)
-    n_train_single = max(30, int(n_total * TRAIN_FRAC))
-    n_train_single = min(n_train_single, n_total)
-    initial_train_mask = pd.Series(False, index=pred.index)
-    if n_train_single > 0:
-        initial_train_mask.iloc[:n_train_single] = True
-
+    initial_train_time_mask = _time_based_train_mask(pred.index, TRAIN_FRAC)
     post_maint_train_mask = _build_post_maintenance_train_mask(
         pred.index, maint_windows, POST_MAINT_TRAIN_MINUTES
     )
-    eval_exclude_mask = initial_train_mask | post_maint_train_mask
+    eval_exclude_mask = initial_train_time_mask | post_maint_train_mask
 
     # Event-level evaluation of maintenance_risk thresholds
     best_risk_threshold, risk_alarm_mask, _ = _evaluate_risk_series(
@@ -459,15 +455,12 @@ def _run_per_maintenance_experiment(
     if index.empty:
         raise ValueError("Empty index in per-maintenance experiment.")
 
-    # Initial training slice (shared with the single-model regime)
-    n_total = len(index)
-    n_train_initial = max(30, int(n_total * TRAIN_FRAC))
-    n_train_initial = min(n_train_initial, n_total)
-    initial_train_order_mask = pd.Series(False, index=index)
-    if n_train_initial > 0:
-        initial_train_order_mask.iloc[:n_train_initial] = True
+    # Initial training window (shared with the single-model regime) – this is
+    # the global baseline that every per-maintenance model sees.
+    initial_train_time_mask = _time_based_train_mask(index, TRAIN_FRAC)
+    initial_train_order_mask = initial_train_time_mask.copy()
     # For regime 2 we only exclude maintenance rows from training.
-    initial_train_mask = initial_train_order_mask & (op_phase != 2)
+    initial_train_mask = initial_train_time_mask & (op_phase != 2)
 
     # Post-maintenance training schedule (time-based) and global training-only mask
     post_maint_train_mask = _build_post_maintenance_train_mask(
@@ -540,7 +533,7 @@ def _run_per_maintenance_experiment(
             "test_size": X_test.shape[0],
         }
 
-    # Model 0: pre-W1 region, trained on the initial TRAIN_FRAC slice.
+    # Model 0: pre-W1 region, trained on the initial TRAIN_FRAC slice only.
     first_start = starts[0]
     pre_w1_test_mask = (index < first_start) & (~initial_train_order_mask)
     current_train_mask = initial_train_mask
@@ -550,8 +543,8 @@ def _run_per_maintenance_experiment(
         period_infos.append(seg_info)
 
     # Iterate over maintenance windows; after each, either train a new model on
-    # its post-maintenance training interval or reuse the previous model for
-    # short gaps.
+    # its post-maintenance training interval (plus the global baseline) or
+    # reuse the previous model for short gaps.
     data_start = index.min()
     data_end = index.max()
 
@@ -574,7 +567,9 @@ def _run_per_maintenance_experiment(
             continue
 
         if POST_MAINT_TRAIN_MINUTES <= 0 or gap_minutes <= POST_MAINT_TRAIN_MINUTES:
-            # Gap too short for a dedicated training block: reuse the previous model.
+            # Gap too short for a dedicated post-maintenance training block:
+            # reuse the previous model (which already includes the global
+            # baseline and its last post-maint block in its training mask).
             seg_label = f"gap_after_maint_{j + 1}"
             seg_info = _fit_and_score_segment(seg_label, current_train_mask, gap_mask)
             if seg_info:
@@ -586,12 +581,15 @@ def _run_per_maintenance_experiment(
         if train_end > gap_end:
             train_end = gap_end
 
-        train_mask_new = (
+        # Local post-maintenance block for this cycle (non-maintenance points)
+        local_post_mask = (
             (index > gap_start)
             & (index <= train_end)
             & (index <= gap_end)
             & (op_phase != 2)
         )
+        # Per-cycle training = global baseline + local post-maint block.
+        train_mask_new = initial_train_mask | local_post_mask
         test_mask_new = (index > train_end) & (index < gap_end if j < len(starts) - 1 else index <= gap_end)
 
         seg_label = f"after_maint_{j + 1}"

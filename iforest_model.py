@@ -74,6 +74,19 @@ def _train_iforest_core(
         score_used_all = scores_all
         score_used_train = scores_train
 
+    # Risk-normalized score based on training distribution (percentile rank)
+    train_vals = score_used_train.values.astype(float)
+    train_vals = train_vals[np.isfinite(train_vals)]
+    if train_vals.size:
+        sorted_train = np.sort(train_vals)
+        all_vals = score_used_all.values.astype(float)
+        all_vals = np.where(np.isfinite(all_vals), all_vals, -np.inf)
+        ranks = np.searchsorted(sorted_train, all_vals, side="right")
+        risk_score = ranks / float(sorted_train.size)
+        risk_score = np.clip(risk_score, 0.0, 1.0)
+    else:
+        risk_score = np.zeros_like(score_used_all.values, dtype=float)
+
     # Thresholding via Q3 + 3*IQR on the training scores only
     train_vals = score_used_train.values.astype(float)
     q1, q3 = np.nanpercentile(train_vals, [25, 75])
@@ -93,6 +106,7 @@ def _train_iforest_core(
     out["anom_score"] = scores_all.values
     if lpf_alpha and lpf_alpha > 0:
         out["anom_score_lpf"] = score_used_all.values
+    out["risk_score"] = risk_score
     out["is_anomaly"] = is_anom
 
     info = {

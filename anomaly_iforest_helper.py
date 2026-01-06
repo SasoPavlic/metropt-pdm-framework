@@ -68,7 +68,7 @@ SAVE_FEATURES_CSV_PATH: Optional[str] = "metropt3_iforest_features.csv"
 # - "single": one global model trained once on an early slice.
 # - "per_maint": per-maintenance models trained on fixed post-maintenance
 #   training days for each cycle (plus an initial pre-W1 model).
-EXPERIMENT_MODE: str = "per_maint"
+EXPERIMENT_MODE: str = "single"
 
 # Optional time-based pre-downsampling rule (e.g., '60s') to regularize cadence before feature building; None disables.
 PRE_DOWNSAMPLE_RULE: Optional[str] = None
@@ -88,6 +88,8 @@ EXCLUDE_QUASI_BINARY: bool = False
 LPF_ALPHA: float = 0.4
 # Rolling risk window (minutes).
 RISK_WINDOW_MINUTES: int = 480
+# Quantile for extreme-point exceedance when building maintenance risk.
+RISK_EXCEEDANCE_QUANTILE: float = 0.95
 # Risk evaluation grid specification (start:stop:step).
 RISK_EVAL_GRID_SPEC: str = "0.05:0.6:0.01"
 # Early-warning horizon for risk evaluation (minutes).
@@ -259,6 +261,43 @@ def _compute_pointwise_metrics(
     return confusion_and_scores(y_true, y_pred)
 
 
+def _compute_segmented_risk(
+    risk_base: pd.Series,
+    segment_masks: List[pd.Series],
+) -> pd.Series:
+    """Compute rolling risk within each segment, resetting at boundaries."""
+    risk = pd.Series(0.0, index=risk_base.index, name="maintenance_risk")
+    if risk_base.empty or not segment_masks:
+        return risk
+
+    for seg_mask in segment_masks:
+        seg_mask = seg_mask.reindex(risk_base.index).fillna(False)
+        if not seg_mask.any():
+            continue
+        seg_vals = risk_base[seg_mask].astype(float).fillna(0.0)
+        seg_risk = (
+            seg_vals.rolling(f"{RISK_WINDOW_MINUTES}min", min_periods=1)
+            .mean()
+            .astype(np.float32)
+            .fillna(0.0)
+        )
+        risk.loc[seg_mask] = seg_risk
+
+    return risk
+
+
+def _ensure_bool_mask(mask: object, index: pd.Index) -> pd.Series:
+    """Coerce a mask into a boolean Series aligned to index."""
+    if isinstance(mask, pd.Series):
+        out = mask.reindex(index).fillna(False)
+    else:
+        arr = np.asarray(mask, dtype=bool)
+        if arr.shape[0] != len(index):
+            raise ValueError("Mask length does not match index length.")
+        out = pd.Series(arr, index=index)
+    return out.astype(bool)
+
+
 def _evaluate_risk_series(
     maintenance_risk: pd.Series,
     maint_windows: List[Tuple],
@@ -330,6 +369,19 @@ def _evaluate_risk_series(
     return best_risk_threshold, risk_alarm_mask, risk_results
 
 
+def _log_risk_summary(
+    best_risk_threshold: Optional[float],
+    risk_alarm_mask: Optional[pd.Series],
+) -> None:
+    if best_risk_threshold is None or risk_alarm_mask is None:
+        return
+    coverage = float(risk_alarm_mask.mean() * 100.0) if len(risk_alarm_mask) else 0.0
+    print(
+        f"[INFO] Risk quantile={RISK_EXCEEDANCE_QUANTILE:.2f}, "
+        f"alarm θ={best_risk_threshold:.2f}, coverage={coverage:.1f}%"
+    )
+
+
 def _run_single_model_experiment(
     X: pd.DataFrame,
     maint_windows: List[Tuple],
@@ -352,27 +404,28 @@ def _run_single_model_experiment(
 
     pred = pred_if.copy()
 
-    # Rolling maintenance risk from exceedance of the training threshold
-    score_for_risk = (
-        pred["anom_score_lpf"] if "anom_score_lpf" in pred.columns else pred["anom_score"]
-    ).astype(float).fillna(0.0)
-    tau = info.get("threshold")
-    if tau is None:
-        q3 = info.get("q3")
-        iqr = info.get("iqr")
-        if q3 is not None and iqr is not None:
-            tau = float(q3 + 3.0 * iqr)
-        else:
-            finite = score_for_risk.to_numpy()
-            finite = finite[np.isfinite(finite)]
-            tau = float(np.percentile(finite, 75)) if finite.size else 0.0
-    exceedance = (score_for_risk >= float(tau)).astype(float)
-    maintenance_risk = (
-        exceedance.rolling(f"{RISK_WINDOW_MINUTES}min", min_periods=1)
-        .mean()
-        .astype(np.float32)
-        .fillna(0.0)
-    ).rename("maintenance_risk")
+    # Rolling maintenance risk from normalized risk scores (extreme-point exceedance)
+    if "risk_score" in pred.columns:
+        risk_base = pred["risk_score"].astype(float).fillna(0.0)
+        risk_base = (risk_base >= float(RISK_EXCEEDANCE_QUANTILE)).astype(float)
+    else:
+        score_for_risk = (
+            pred["anom_score_lpf"] if "anom_score_lpf" in pred.columns else pred["anom_score"]
+        ).astype(float).fillna(0.0)
+        tau = info.get("threshold")
+        if tau is None:
+            q3 = info.get("q3")
+            iqr = info.get("iqr")
+            if q3 is not None and iqr is not None:
+                tau = float(q3 + 3.0 * iqr)
+            else:
+                finite = score_for_risk.to_numpy()
+                finite = finite[np.isfinite(finite)]
+                tau = float(np.percentile(finite, 75)) if finite.size else 0.0
+        risk_base = (score_for_risk >= float(tau)).astype(float)
+    maintenance_risk = _compute_segmented_risk(
+        risk_base, [pd.Series(True, index=pred.index)]
+    )
     pred["maintenance_risk"] = maintenance_risk
     pred["operation_phase"] = op_phase
 
@@ -389,6 +442,7 @@ def _run_single_model_experiment(
     best_risk_threshold, risk_alarm_mask, _ = _evaluate_risk_series(
         maintenance_risk, maint_windows, tag="RISK"
     )
+    _log_risk_summary(best_risk_threshold, risk_alarm_mask)
 
     # Exact training cutoff timestamp on the prediction index
     train_cutoff_ts: Optional[pd.Timestamp] = None
@@ -477,7 +531,7 @@ def _run_per_maintenance_experiment(
     global_train_for_eval = initial_train_order_mask | post_maint_train_mask
 
     pred = pd.DataFrame(index=index)
-    exceedance = pd.Series(index=index, dtype=float)
+    risk_segments: List[pd.Series] = []
 
     period_infos: List[dict] = []
 
@@ -486,11 +540,14 @@ def _run_per_maintenance_experiment(
         f"(pre-W1 plus one cycle per maintenance window)"
     )
 
-    # Helper: fit IF on X_train and score X_test; update pred/exceedance.
+    # Helper: fit IF on X_train and score X_test; update per-point predictions.
     def _fit_and_score_segment(
         seg_label: str, train_mask: pd.Series, test_mask: pd.Series
     ) -> Optional[dict]:
-        nonlocal pred, exceedance
+        nonlocal pred, risk_segments
+
+        train_mask = _ensure_bool_mask(train_mask, index)
+        test_mask = _ensure_bool_mask(test_mask, index)
 
         if not test_mask.any():
             return None
@@ -516,29 +573,21 @@ def _run_per_maintenance_experiment(
         if "anom_score_lpf" in slice_pred.columns:
             pred.loc[test_mask, "anom_score_lpf"] = slice_pred["anom_score_lpf"]
         pred.loc[test_mask, "is_anomaly"] = slice_pred["is_anomaly"]
+        if "risk_score" in slice_pred.columns:
+            pred.loc[test_mask, "risk_score"] = slice_pred["risk_score"]
 
-        score_for_risk = (
-            slice_pred["anom_score_lpf"]
-            if "anom_score_lpf" in slice_pred.columns
-            else slice_pred["anom_score"]
-        ).astype(float).fillna(0.0)
-        tau = info.get("threshold")
-        if tau is None:
-            q3 = info.get("q3")
-            iqr = info.get("iqr")
-            if q3 is not None and iqr is not None:
-                tau = float(q3 + 3.0 * iqr)
-            else:
-                finite = score_for_risk.to_numpy()
-                finite = finite[np.isfinite(finite)]
-                tau = float(np.percentile(finite, 75)) if finite.size else 0.0
-        exceedance_slice = (score_for_risk >= float(tau)).astype(float)
-        exceedance.loc[test_mask] = exceedance_slice
+        risk_segments.append(test_mask)
 
         return {
             "segment": seg_label,
             "train_size": info["n_train"],
             "test_size": X_test.shape[0],
+            "threshold": info.get("threshold"),
+            "pct_anom": info.get("pct_anom"),
+            "train_start": X_train.index.min(),
+            "train_end": X_train.index.max(),
+            "test_start": X_test.index.min(),
+            "test_end": X_test.index.max(),
         }
 
     # Model 0: pre-W1 region, trained on the initial TRAIN_FRAC slice only.
@@ -556,7 +605,13 @@ def _run_per_maintenance_experiment(
     data_start = index.min()
     data_end = index.max()
 
-    for j, end_ts in enumerate(ends):
+    for j, (start_ts, end_ts) in enumerate(zip(starts, ends)):
+        # Score the maintenance window itself with the current model (risk only).
+        maint_mask = (index >= pd.to_datetime(start_ts)) & (index <= pd.to_datetime(end_ts))
+        seg_info = _fit_and_score_segment(f"maint_{j + 1}", current_train_mask, maint_mask)
+        if seg_info:
+            period_infos.append(seg_info)
+
         gap_start = pd.to_datetime(end_ts)
         if j < len(starts) - 1:
             gap_end = pd.to_datetime(starts[j + 1])
@@ -606,14 +661,13 @@ def _run_per_maintenance_experiment(
             period_infos.append(seg_info)
             current_train_mask = train_mask_new
 
-    # Any points with no exceedance value (e.g., unscored periods) are treated as zero risk.
-    exceedance = exceedance.fillna(0.0)
-    maintenance_risk = (
-        exceedance.rolling(f"{RISK_WINDOW_MINUTES}min", min_periods=1)
-        .mean()
-        .astype(np.float32)
-        .fillna(0.0)
-    ).rename("maintenance_risk")
+    # Compute maintenance risk per segment (reset at segment boundaries).
+    if "risk_score" in pred.columns:
+        risk_base = pred["risk_score"].astype(float).fillna(0.0)
+        risk_base = (risk_base >= float(RISK_EXCEEDANCE_QUANTILE)).astype(float)
+    else:
+        risk_base = pd.Series(0.0, index=index)
+    maintenance_risk = _compute_segmented_risk(risk_base, risk_segments)
     pred["maintenance_risk"] = maintenance_risk
     pred["operation_phase"] = op_phase
 
@@ -621,6 +675,7 @@ def _run_per_maintenance_experiment(
     best_risk_threshold, risk_alarm_mask, _ = _evaluate_risk_series(
         maintenance_risk, mw_sorted, tag="RISK-PERMAINT"
     )
+    _log_risk_summary(best_risk_threshold, risk_alarm_mask)
 
     # Point-wise metrics on rows with predictions (normal + pre-maintenance only),
     # excluding all training-only rows (initial slice + post-maint training days).
@@ -682,7 +737,7 @@ def main() -> None:
     plot_raw_timeline(
         df_plot,
         maint_windows,
-        save_fig=SAVE_FIG_PATH,
+        save_fig=EXPERIMENT_MODE + '_' + SAVE_FIG_PATH,
         train_frac=TRAIN_FRAC if mode == "single" else None,
         train_cutoff_time=train_cutoff_ts,
         show_window_labels=effective_show_labels,

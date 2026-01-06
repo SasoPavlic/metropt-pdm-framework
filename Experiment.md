@@ -1,215 +1,202 @@
-## MetroPT-IForest Experiments (opis workflowa)
+## MetroPT-IForest Experimenti (opis workflowa)
+
+Dokument opisuje trenutni workflow v repozitoriju MetroPT-IF-model in dve rezimi ucenja:
+- **single** (en globalni model)
+- **per_maint** (adaptivni model po servisih)
+
+Opis je skladen s kodo in naj iz njega bralec razume, kako se podatki berejo, kako se modeli ucijo, kako se tvori risk signal in kako poteka evaluacija.
+
+---
 
 ## 1) Branje in priprava podatkov
 
-### Kakšni so podatki v CSV
-MetroPT3 vsebuje casovne vrste iz tramvaja (APU). V stolpcih se pojavljajo:
-- analogni senzorji (npr. tlaki, temperature, tok motorja),
-- binarni/kvazi‑binarni signali (npr. stikala ali stanja ventilov 0/1),
+### Kakrsni so podatki
+`MetroPT3.csv` vsebuje casovne vrste iz APU sistema tramvaja. Stolpci so:
+- analogni senzorji (npr. tlaki, temperature, tokovi),
+- binarni/kvazi-binarni signali (0/1),
 - `timestamp` (casovni zig).
 
 Program CSV prebere, `timestamp` uredi in nastavi kot indeks.
 
-### PRE_DOWNSAMPLE_RULE (opcijsko, tako imajo v članku MetroPT)
-`PRE_DOWNSAMPLE_RULE` je pravilo resamplinga (npr. `"60s"`). Ce je nastavljen:
+### PRE_DOWNSAMPLE_RULE (opcijsko)
+`PRE_DOWNSAMPLE_RULE` je pravilo resamplinga (npr. `"60s"`). Ce je nastavljeno:
 - podatke agregiramo na enakomeren casovni korak,
 - v vsakem intervalu vzamemo median.
 
-**Zakaj to pomaga:**
-- odpravi neenakomerne casovne razmake,
-- zmanjsa sum,
-- omogoci stabilne rolling znacilke.
+To pomaga pri stabilnih rolling znacilkah in zmanjsa vpliv neenakomerne cadence.
 
-### Izbor znacilk (feature engineering)
-Program vzame samo numericne stolpce. Nato:
-- lahko odstrani kvazi‑binarne stolpce (ce so prevec 0/1),
-- izmed preostalih izbere `MAX_BASE_FEATURES` z najvecjo varianco.
+### Izbor znacilk
+- vzamemo numericne stolpce,
+- lahko odstranimo kvazi-binarne signale,
+- izberemo `MAX_BASE_FEATURES` z najvecjo varianco.
 
-**Zakaj to delamo:**
-- zmanjsamo dimenzionalnost,
-- omejimo sum,
-- ohranimo najbolj informativne signale.
+Namen: zmanjsati dimenzionalnost in ohraniti najbolj informativne signale.
 
 ### Rolling znacilke
-Na izbranih signalih naredimo rolling statistike v oknu `ROLLING_WINDOW` (npr. mean, std, min, max, skew). Rezultat je matrika `X` (cas × znacilke), ki jo dobi model.
+Na izbranih signalih naredimo rolling statistike v oknu `ROLLING_WINDOW` (mean, std, min, max, skew ...). Rezultat je matrika `X`, ki jo dobijo modeli.
 
 ---
 
-## 2) Maintenance okna in faze (operation_phase)
+## 2) Maintenance okna in faze
 
-Maintenance okna so vzeta **iz clanka Davari et al. (2021)**. Na tej osnovi vsak timestamp dobi fazo:
-- `operation_phase = 0` → normalno,
-- `operation_phase = 1` → pre‑maintenance (npr. 2 uri pred servisom; `PRE_MAINTENANCE_HOURS`),
-- `operation_phase = 2` → maintenance (servis).
+Maintenance okna so vzeta **iz clanka Davari et al. (2021)**. Vsak timestamp dobi fazo:
+- `operation_phase = 0` -> normalno stanje
+- `operation_phase = 1` -> pre-maintenance (npr. 2h pred servisom)
+- `operation_phase = 2` -> maintenance (servis)
 
-Faze **niso vhod modela**, uporabljajo se izkljucno za evaluacijo.
+Faze **niso vhod modela**, uporabljajo se samo za evaluacijo.
 
 ---
 
 # Dve vrsti detekcije anomalij
 
-## A) Point‑wise anomalije (po vrstici)
-Model vsaki vrstici dodeli `is_anomaly` (0/1).
-- `is_anomaly = 1`, ce je `anom_score >= threshold`.
-- `threshold` = `Q3 + 3*IQR` iz **ucnih** score‑ov.
+## A) Point-wise anomalije (po vrstici)
+Model vsaki vrstici dodeli `is_anomaly` (0/1):
+- `is_anomaly = 1`, ce je `anom_score >= threshold`
+- `threshold = Q3 + 3*IQR` iz **ucnih** score-ov
 
-### Point‑wise evalvacija (TP/FP/FN/TN)
-V evaluacijo gredo le faze 0 in 1:
-- **TP**: `phase=1` in `is_anomaly=1`
-- **FP**: `phase=0` in `is_anomaly=1`
-- **FN**: `phase=1` in `is_anomaly=0`
-- **TN**: `phase=0` in `is_anomaly=0`
-- `phase=2` je **ignorirana**.
+### Point-wise evaluacija
+V evaluacijo gredo samo faze 0 in 1:
+- **TP**: phase=1 in is_anomaly=1
+- **FP**: phase=0 in is_anomaly=1
+- **FN**: phase=1 in is_anomaly=0
+- **TN**: phase=0 in is_anomaly=0
+- phase=2 je ignorirana
 
-Iz point‑wise evaluacije so dodatno izloceni:
+Iz point-wise evaluacije so dodatno izloceni:
 - zacetni ucni interval (`TRAIN_FRAC` minut),
-- vsi post‑maintenance ucni intervali,
-da je primerjava med rezimoma fer.
+- vsi post-maintenance ucni intervali (fer primerjava med rezimi).
 
 ---
 
-## B) Collective anomalije (event‑level)
-Collective anomalija ni nova oznaka v podatkih, ampak agregacija point‑wise anomalij skozi casovno okno.
+## B) Collective anomalije (event-level)
+Event-level logika je zgrajena na **risk signalu**, ki meri gostoto ekstremnih tock v zadnjem casovnem oknu.
 
 **Koraki:**
-1. `exceedance`  
-   - `exceedance = 1`, kjer je `anom_score >= threshold`.  
-   - to je binarni signal "presega prag".
-2. `maintenance_risk`  
-   - rolling povprecje `exceedance` v oknu `RISK_WINDOW_MINUTES`.  
-   - predstavlja **delez anomalij v zadnjem casovnem oknu**.
-3. Alarm interval  
-   - vsak neprekinjen segment, kjer `maintenance_risk >= θ`.
+1) `risk_score` (normaliziran score)
+   - vsak model oceni tocke in izracuna `risk_score` kot percentilni rang score-a glede na ucno porazdelitev
+   - `risk_score` je v intervalu [0, 1]
 
-**Mini primer (poenostavljeno):**
-```
-timestamp           exceedance  maintenance_risk  alarm?
-10:00               0           0.02              no
-10:05               1           0.05              no
-10:10               1           0.12              yes
-10:15               1           0.18              yes
-10:20               0           0.09              no
-```
-Alarm interval je 10:10–10:15.
+2) `exceedance` ekstremov
+   - `exceedance = 1`, ce `risk_score >= RISK_EXCEEDANCE_QUANTILE`
+   - npr. 0.95 pomeni, da upostevamo le top 5% tock po tveganju
 
-### Event‑level TP/FP/FN (primer iz MetroPT)
-Recimo servis #7:  
-`2020-05-18 05:00 → 05:30` in `EARLY_WARNING_MINUTES = 120`.
-Potem je veljavno okno za TP:
-`03:00 → 05:30`.
+3) `maintenance_risk`
+   - rolling povprecje `exceedance` v oknu `RISK_WINDOW_MINUTES`
+   - to je delez ekstremnih tock v zadnjem oknu
+   - **v per_maint rezimu se rolling izracuna z resetom na segmentih** (ne prelivamo med segmenti)
 
-- **TP**: zacetek alarma pade v to okno (npr. 03:10).
-- **FN**: noben alarm se ne zacne v tem oknu.
-- **FP**: alarm interval, ki ni povezan z nobenim servisom.
-- **TN** na event nivoju ni definiran (ni negativnih “eventov”).
+4) Alarm interval
+   - vsak neprekinjen segment, kjer `maintenance_risk >= θ`
+
+### Event-level TP/FP/FN
+Za servis zacetek `start` in konec `end` velja okno:
+`[start - EARLY_WARNING_MINUTES, end]`
+
+- **TP**: alarm interval se s tem oknom **prekriva** (overlap)
+- **FN**: noben alarm se ne prekriva z oknom
+- **FP**: alarm interval, ki ne pripada nobenemu servisu
+- **TN** na event nivoju ni definiran (ni negativnih “eventov”)
 
 ---
 
 # Rezim A: Single model (`EXPERIMENT_MODE="single"`)
 
 ## Ucenje
-- Model se uci **na prvih `TRAIN_FRAC` minutah** (trenutno 1440 min = 24h).
-- Iz ucnih vrstic so izlocene `operation_phase == 2`.
-  - **Zakaj?** Ne zelimo, da se model "nauci" vzorec servisa kot normalno stanje.
+- model se uci na prvih `TRAIN_FRAC` minutah (trenutno 1440 min)
+- `operation_phase == 2` je iz ucne mnozice izlocen
 
 ## Scoring
-- Model oceni **vse** vrstice.
-- `anom_score` je osnovni IF score; `anom_score_lpf` je opcijsko glajenje (LPF), ki zmanjsa sum in kratke spike. (Tako so imeli v članku)
+- model oceni vse vrstice v timeline-u
+- izracuna `anom_score`, `is_anomaly` in `risk_score`
 
 ## Evaluacija
-Point‑wise in event‑level logika je enaka kot zgoraj.  
-Za fer primerjavo se izlocijo tudi post‑maintenance ucni intervali.
+- point-wise in event-level logika kot zgoraj
+- izlocimo tudi vse post-maintenance ucne intervale (fer primerjava s per_maint)
 
 ---
 
-# Rezim B: Per‑maintenance model (`EXPERIMENT_MODE="per_maint"`)
+# Rezim B: Per-maintenance (`EXPERIMENT_MODE="per_maint"`)
 
 ## Globalni baseline
-- **Globalni baseline** = isti zacetni TRAIN_FRAC interval (brez phase 2).
-- Ta baseline je **vedno** del ucnih podatkov vsakega per‑maint modela.
-- To **ni fine‑tuning**; vsak model se uci znova na (baseline + lokalni interval).
+- baseline = zacetni `TRAIN_FRAC` interval (brez phase=2)
+- vsak nov model se uci na **baseline + lokalni post-maint interval**
+- to ni fine-tuning, vsak model se uci znova
 
-## Legenda oznak
-- `Wj` = j‑ti servisni interval  
-- `start_j`, `end_j` = zacetek in konec servisa  
-- `gap` = interval `(end_j, start_{j+1})`  
-- `POST_MAINT_TRAIN_MINUTES` = dolzina lokalnega ucnega intervala po servisu
-
-## Ucenje in test po servisih
+## Segmenti in ucenje
 Za vsak servis `Wj`:
+- najprej se **oceni maintenance okno** z obstoječim modelom (risk only)
 - definira se `gap = (end_j, start_{j+1})`
-- ce je `gap <= POST_MAINT_TRAIN_MINUTES`:
-  - **ne treniramo** novega modela, uporabimo prejsnjega
+- ce je gap kratek (`<= POST_MAINT_TRAIN_MINUTES`):
+  - nov model se ne uci, uporabi se prejsnji
 - ce je gap daljsi:
-  - lokalni ucni interval = prvih `POST_MAINT_TRAIN_MINUTES` po `end_j`
-  - ucenje = **baseline + lokalni interval** (brez phase 2)
-  - test = preostanek gap‑a do naslednjega servisa
+  - prvih `POST_MAINT_TRAIN_MINUTES` po servisu je lokalni ucni interval
+  - ucenje = baseline + lokalni interval (brez phase=2)
+  - test = preostanek gap-a
 
-## Scoring
-- Vsak segment dobi svoj IF model (ali ponovno uporabi prejsnjega).
-- `anom_score`, `is_anomaly` in `threshold` so segment‑specificni.
-- **"Zlepljen exceedance"** pomeni:
-  - za vsak timestamp vzamemo `exceedance` iz modela, ki pokriva ta segment,
-  - vse segmente zdruzimo v en casovni niz,
-  - iz tega nastane enoten `maintenance_risk`.
-
-## Point‑wise evaluacija
-Da, vsak model oznacuje **samo** vrstice v svojem test intervalu.  
-Nato se vse oznake zdruzijo in evalvirajo enako kot pri single:
-- phase 1 = pozitivno, phase 0 = negativno, phase 2 ignorirano.
-- izlocimo baseline + post‑maintenance ucne intervale (fer primerjava).
-
-## Event‑level evaluacija
-Event‑level logika je **enaka** kot pri single, ker:
-- na koncu dobimo **enoten `maintenance_risk`** niz,
-- alarm intervali se racunajo na celotnem nizu,
-- TP/FN/FP definicije so iste.
+## Scoring in risk
+- vsak segment ima svoj model
+- `risk_score` se racuna glede na **segmentno ucno porazdelitev**
+- `maintenance_risk` se racuna **z resetom na segmentih**
+- alarmi se oblikujejo iz celotnega risk signala
 
 ---
 
-# Ključne razlike
+# Klucne razlike
 
-| Lastnost | Single | Per‑maintenance |
+| Lastnost | Single | Per-maintenance |
 |---|---|---|
-| Stevilo modelov | 1 | vec (po servisih) |
-| Ucni podatki | samo zacetni TRAIN_FRAC interval | baseline + lokalni post‑maint interval |
-| Score/threshold | globalen | segment‑specificen |
-| Point‑wise logika | ista | ista |
-| Collective logika | ista | ista |
+| Stevilo modelov | 1 | vec (po servisih + maintenance segmenti) |
+| Ucni podatki | samo zacetni TRAIN_FRAC | baseline + lokalni post-maint |
+| Risk normalizacija | globalna | segmentna |
+| Risk rolling | enoten | resetiran na segmentih |
+| Event-level logika | ista | ista |
 
 ---
 
-# Rezultati
+# Rezultati (zadnji zagon)
 
-### Event‑level (Best θ)
-| Regime | Tag | θ | TP | FP | FN | Precision | Recall | F1 |
-|---|---|---:|---:|---:|---:|---:|---:|---:|
-| Single | `[RISK]` | 0.60 | 7 | 32 | 14 | 0.1795 | 0.3333 | 0.2333 |
-| Per‑maint | `[RISK-PERMAINT]` | 0.27 | 2 | 85 | 19 | 0.0230 | 0.0952 | 0.0370 |
+### Event-level (Best θ)
+| Rezim | Tag | θ | TP | FP | FN | Precision | Recall | F1 | Coverage |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Single | `[RISK]` | 0.56 | 8 | 23 | 13 | 0.2581 | 0.3810 | 0.3077 | 5.3% |
+| Per-maint | `[RISK-PERMAINT]` | 0.48 | 16 | 31 | 5 | 0.3404 | 0.7619 | 0.4706 | 4.4% |
 
-### Point‑wise
-| Regime | Tag | TP | FP | FN | TN | Precision | Recall | F1 | Accuracy |
+### Point-wise
+| Rezim | Tag | TP | FP | FN | TN | Precision | Recall | F1 | Accuracy |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
 | Single | `[METRIC] Single-model` | 2261 | 240374 | 6718 | 1111512 | 0.0093 | 0.2518 | 0.0180 | 0.8184 |
-| Per‑maint | `[METRIC] Per-maint-model` | 2456 | 201039 | 6523 | 1150846 | 0.0121 | 0.2735 | 0.0231 | 0.8475 |
+| Per-maint | `[METRIC] Per-maint-model` | 2456 | 201039 | 6523 | 1150846 | 0.0121 | 0.2735 | 0.0231 | 0.8475 |
+
+**Interpretacija:**
+- Per-maint ima visjo event-level F1 pri nizji pokritosti alarma (coverage).
+- Single je bolj konservativen, a z nizjo recall vrednostjo.
 
 ---
 
-# Vizualizacija
+# Vizualizacija (intuicija)
 
 Single:
 ```
-TRAIN_FRAC --------> [model A] ----------------------------------> scoring vseh vrstic
+TRAIN_FRAC ----> [model A] ----------------------------------> scoring vseh vrstic
 ```
 
-Per‑maint:
+Per-maint:
 ```
-baseline + post‑maint_1 --> model B --> scoring gap_1
-baseline + post‑maint_2 --> model C --> scoring gap_2
+baseline + post-maint_1 --> model B --> scoring gap_1
+baseline + post-maint_2 --> model C --> scoring gap_2
 ...
 ```
 
-Rezultat v obeh rezimih je:
-- `is_anomaly` za vsako vrstico (point‑wise)
+Rezultat v obeh rezimih:
+- `is_anomaly` za vsako vrstico (point-wise)
 - `maintenance_risk` za casovno okno (collective)
-- TP/FP/FN/TN (point‑wise) in TP/FP/FN (event‑level)
+- TP/FP/FN/TN (point-wise) in TP/FP/FN (event-level)
+
+## Grafi (trenutni zagon)
+
+### Per-maintenance
+![Per-maint risk timeline](per_maint_metropt3_iforest_raw.png)
+
+### Single
+![Single risk timeline](single_metropt3_iforest_raw.png)

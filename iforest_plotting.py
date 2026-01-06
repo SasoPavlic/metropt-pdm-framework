@@ -49,9 +49,10 @@ def plot_raw_timeline(
         label="Normal",
         zorder=0,
     )
+    coverage = float(state.mean() * 100.0) if len(state) else 0.0
     risk_label = "Risk alarm"
     if risk_threshold is not None:
-        risk_label = f"Risk alarm (≥ θ={risk_threshold:.2f})"
+        risk_label = f"Risk alarm (≥ θ={risk_threshold:.2f}, {coverage:.1f}% coverage)"
     ax.fill_between(
         df_plot.index,
         0,
@@ -62,6 +63,28 @@ def plot_raw_timeline(
         label=risk_label,
         zorder=1,
     )
+
+    # Plot risk curve for visibility of threshold vs signal
+    risk_series = df_plot["maintenance_risk"].astype(float).fillna(0.0)
+    ax.plot(
+        df_plot.index,
+        risk_series.values,
+        color="#263238",
+        linewidth=1.0,
+        alpha=0.7,
+        label="Maintenance risk",
+        zorder=2,
+    )
+    if risk_threshold is not None:
+        ax.axhline(
+            float(risk_threshold),
+            color="#FF7043",
+            linestyle="--",
+            linewidth=1.0,
+            alpha=0.9,
+            label="Risk threshold",
+            zorder=3,
+        )
 
     # Training cutoff
     cutoff_ts = train_cutoff_time
@@ -163,9 +186,9 @@ def plot_raw_timeline(
     ax.legend(handles, labels, loc="best")
 
     ax.set_xlabel("Time")
-    ax.set_ylabel("Risk state")
-    ax.set_yticks([0.25, 0.75])
-    ax.set_yticklabels(["Normal", "Risk"])
+    ax.set_ylabel("Maintenance risk")
+    ax.set_yticks([0.0, 0.5, 1.0])
+    ax.set_yticklabels(["0.0", "0.5", "1.0"])
     ax.set_ylim(0, 1)
     ax.grid(True, axis="x", alpha=0.2)
 

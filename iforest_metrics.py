@@ -76,12 +76,13 @@ def _risk_scores(
 
     for fst, fend in failure_windows:
         matched = False
-        earliest_start = fst - horizon
-        latest_start = fend
+        window_start = fst - horizon
+        window_end = fend
         for i, (ast, aend) in enumerate(alarm_intervals):
             if alarm_used[i]:
                 continue
-            if ast >= earliest_start and ast <= latest_start:
+            # Any overlap between alarm interval and [window_start, window_end]
+            if ast <= window_end and aend >= window_start:
                 alarm_used[i] = True
                 tp += 1
                 matched = True

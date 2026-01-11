@@ -4,10 +4,9 @@
 Single-series IsolationForest anomaly explorer (native timeline plot, MetroPT-3).
 
 - Loads CSV/TXT specific to this project (no MAT/Parquet to keep it simple).
-- Optional pre-downsample (time median) to regularize cadence.
-- Rolling stats over a compact feature set.
-- Train on first N% (chronological), score all points.
-- Label by a robust (Q3 + 3*IQR) threshold on (optionally LPF-smoothed) IF scores.
+- Rolling stats over all numeric features.
+- Train on the first N minutes (chronological), score all points.
+- Label by a robust (Q3 + 3*IQR) threshold on IF scores.
 - Plot ORIGINAL timeline with point colors (normal/anomalous) + shaded/marked failure windows with labels.
 """
 
@@ -24,12 +23,10 @@ from iforest_data import (
     build_rolling_features,
     load_csv,
     parse_maintenance_windows,
-    pre_downsample,
     select_numeric_features,
-    top_k_by_variance,
 )
 from iforest_metrics import confusion_and_scores, evaluate_risk_thresholds
-from iforest_model import train_iforest_and_score, train_iforest_on_slices, _time_based_train_mask
+from iforest_model import train_iforest_on_slices, _time_based_train_mask
 from iforest_plotting import plot_raw_timeline
 
 
@@ -70,30 +67,17 @@ SAVE_FEATURES_CSV_PATH: Optional[str] = "metropt3_iforest_features.csv"
 #   training days for each cycle (plus an initial pre-W1 model).
 EXPERIMENT_MODE: str = "single"
 
-# Optional time-based pre-downsampling rule (e.g., '60s') to regularize cadence before feature building; None disables.
-PRE_DOWNSAMPLE_RULE: Optional[str] = None
 # Rolling window for feature aggregation (e.g., '600s' = 10 minutes).
 ROLLING_WINDOW: str = "60s"
-# Fraction of earliest data used to train the IsolationForest.
 # Duration (minutes) of the initial training window (chronological from the start).
-# Previously this was a fraction; now it is interpreted as minutes.
 TRAIN_FRAC: float = 1440
-# Limit of most-variable base numeric features to keep before rolling aggregation.
-MAX_BASE_FEATURES: int = 12
-# Exclude near-binary numeric columns from features to focus on informative signals.
-EXCLUDE_QUASI_BINARY: bool = False
-
 # --- Modeling / scoring ---
-# Exponential low-pass filter alpha for anomaly scores; 0 disables smoothing.
-LPF_ALPHA: float = 0.4
 # Rolling risk window (minutes).
 RISK_WINDOW_MINUTES: int = 480
 # Quantile for extreme-point exceedance when building maintenance risk.
 RISK_EXCEEDANCE_QUANTILE: float = 0.95
 # Risk evaluation grid specification (start:stop:step).
-RISK_EVAL_GRID_SPEC: str = "0.05:0.6:0.01"
-# Early-warning horizon for risk evaluation (minutes).
-EARLY_WARNING_MINUTES: int = 120
+RISK_EVAL_GRID_SPEC: str = "0.30:0.90:0.10"
 # Length of the post-maintenance training interval (in minutes) for the
 # per-maintenance regime. For each maintenance window W_j, the next model
 # (if any) is trained on the interval [end_j, end_j + POST_MAINT_TRAIN_MINUTES),
@@ -103,8 +87,9 @@ EARLY_WARNING_MINUTES: int = 120
 POST_MAINT_TRAIN_MINUTES: int = 1440
 
 # --- Maintenance context / plotting ---
-# Hours before maintenance start considered pre-maintenance (operation_phase=1).
-PRE_MAINTENANCE_HOURS: int = 2
+# Minutes before maintenance start considered pre-maintenance (operation_phase=1)
+# and used as the early-warning horizon for event-level evaluation.
+PRE_MAINTENANCE_MINUTES: int = 120
 # Show labels for maintenance windows (IDs/severity) on the plot.
 SHOW_WINDOW_LABELS: bool = True
 # Font size for maintenance window labels.
@@ -157,20 +142,16 @@ def _build_features_and_context() -> Tuple[pd.DataFrame, List[Tuple], pd.Series]
     """Load raw data, engineer rolling features, and build maintenance context."""
     df_raw = load_csv(INPUT_PATH, INPUT_TIMESTAMP_COL, drop_unnamed=DROP_UNNAMED_INDEX)
 
-    # Optional pre-downsample before feature building
-    df_ds = pre_downsample(df_raw, PRE_DOWNSAMPLE_RULE)
-
-    # Base numeric features (optionally exclude quasi-binary, then top-K by variance)
+    # Base numeric features (all numeric columns, ordered by preference if provided)
     base_feats = select_numeric_features(
-        df_ds,
+        df_raw,
         prefer=LIKELY_METROPT_FEATURES,
-        exclude_quasi_binary=EXCLUDE_QUASI_BINARY,
     )
     if not base_feats:
-        raise ValueError("No numeric features found after binary exclusion.")
-    df_base = top_k_by_variance(df_ds[base_feats].copy(), MAX_BASE_FEATURES)
+        raise ValueError("No numeric features found in the input data.")
+    df_base = df_raw[base_feats].copy()
 
-    # Rolling features on the compact set
+    # Rolling features on all numeric signals
     X = build_rolling_features(df_base, rolling_window=ROLLING_WINDOW)
     if SAVE_FEATURES_CSV_PATH:
         feats_out = X.copy()
@@ -187,7 +168,7 @@ def _build_features_and_context() -> Tuple[pd.DataFrame, List[Tuple], pd.Series]
     operation_phase = build_operation_phase(
         index=X.index,
         windows=maint_windows,
-        pre_hours=PRE_MAINTENANCE_HOURS,
+        pre_minutes=PRE_MAINTENANCE_MINUTES,
     ).astype(np.int8)
 
     return X, maint_windows, operation_phase
@@ -307,65 +288,70 @@ def _evaluate_risk_series(
     risk_thresholds: List[float] = []
     risk_alarm_mask: Optional[pd.Series] = None
     best_risk_threshold: Optional[float] = None
+
     try:
         risk_thresholds = parse_risk_grid_spec(RISK_EVAL_GRID_SPEC)
     except ValueError as exc:
         print(f"[WARN] Skipping maintenance_risk evaluation: {exc}")
-    if risk_thresholds:
-        risk_results = evaluate_risk_thresholds(
-            risk=maintenance_risk,
-            maintenance_windows=maint_windows,
-            thresholds=risk_thresholds,
-            early_warning_minutes=EARLY_WARNING_MINUTES,
-        )
-        if risk_results:
-            print(
-                f"[{tag}] Rolling window={RISK_WINDOW_MINUTES} min, early-warning horizon={EARLY_WARNING_MINUTES} min"
-            )
-            for res in risk_results:
-                print(
-                    f"[{tag}] θ={res['threshold']:.2f}  Precision={res['precision']:.4f}  "
-                    f"Recall={res['recall']:.4f}  F1={res['f1']:.4f}  TP={res['tp']}  FP={res['fp']}  FN={res['fn']}"
-                )
-            best = max(risk_results, key=lambda r: (r["f1"], r["precision"], -r["threshold"]))
-            print(
-                f"[{tag}] Best θ={best['threshold']:.2f}: Precision={best['precision']:.4f}  "
-                f"Recall={best['recall']:.4f}  F1={best['f1']:.4f}  "
-                f"TP={best['tp']}  FP={best['fp']}  FN={best['fn']}"
-            )
-            # Diagnostics: for each failure window, show max risk inside the
-            # early-warning horizon. This helps understand why TP may be zero.
-            try:
-                horizon = pd.to_timedelta(float(max(0.0, EARLY_WARNING_MINUTES)), unit="m")
-                windows: List[Tuple[pd.Timestamp, pd.Timestamp]] = []
-                for w in maint_windows or []:
-                    if len(w) < 2:
-                        continue
-                    s = pd.to_datetime(w[0])
-                    e = pd.to_datetime(w[1])
-                    if pd.isna(s) or pd.isna(e) or e < s:
-                        continue
-                    windows.append((s, e))
-                if windows:
-                    print(f"[{tag}] Per-window max risk within early-warning horizon:")
-                    for idx, (s, e) in enumerate(windows, start=1):
-                        ew_start = s - horizon
-                        rslice = maintenance_risk.loc[ew_start:e]
-                        if rslice.empty:
-                            print(f"[{tag}]   window #{idx}: no risk data in horizon")
-                        else:
-                            max_val = float(rslice.max())
-                            t_max = rslice.idxmax()
-                            print(
-                                f"[{tag}]   window #{idx}: max_risk={max_val:.4f} at {t_max}"
-                            )
-            except Exception as exc:
-                print(f"[WARN] Risk diagnostics failed for tag {tag!r}: {exc}")
-            best_risk_threshold = float(best["threshold"])
-            risk_alarm_mask = (maintenance_risk >= best_risk_threshold).astype(bool)
-    else:
-        risk_results = []
 
+    if not risk_thresholds:
+        return best_risk_threshold, risk_alarm_mask, []
+
+    risk_results = evaluate_risk_thresholds(
+        risk=maintenance_risk,
+        maintenance_windows=maint_windows,
+        thresholds=risk_thresholds,
+        early_warning_minutes=PRE_MAINTENANCE_MINUTES,
+    )
+    if not risk_results:
+        return best_risk_threshold, risk_alarm_mask, []
+
+    print(
+        f"[{tag}] Rolling window={RISK_WINDOW_MINUTES} min, "
+        f"early-warning horizon={PRE_MAINTENANCE_MINUTES} min"
+    )
+    for res in risk_results:
+        print(
+            f"[{tag}] θ={res['threshold']:.2f}  Precision={res['precision']:.4f}  "
+            f"Recall={res['recall']:.4f}  F1={res['f1']:.4f}  TP={res['tp']}  FP={res['fp']}  FN={res['fn']}"
+        )
+
+    best = max(risk_results, key=lambda r: (r["f1"], r["precision"], -r["threshold"]))
+    print(
+        f"[{tag}] Best θ={best['threshold']:.2f}: Precision={best['precision']:.4f}  "
+        f"Recall={best['recall']:.4f}  F1={best['f1']:.4f}  "
+        f"TP={best['tp']}  FP={best['fp']}  FN={best['fn']}"
+    )
+
+    # Diagnostics: for each failure window, show max risk inside the
+    # early-warning horizon. This helps understand why TP may be zero.
+    try:
+        horizon = pd.to_timedelta(float(max(0.0, PRE_MAINTENANCE_MINUTES)), unit="m")
+        windows: List[Tuple[pd.Timestamp, pd.Timestamp]] = []
+        for w in maint_windows or []:
+            if len(w) < 2:
+                continue
+            s = pd.to_datetime(w[0])
+            e = pd.to_datetime(w[1])
+            if pd.isna(s) or pd.isna(e) or e < s:
+                continue
+            windows.append((s, e))
+        if windows:
+            print(f"[{tag}] Per-window max risk within early-warning horizon:")
+            for idx, (s, e) in enumerate(windows, start=1):
+                ew_start = s - horizon
+                rslice = maintenance_risk.loc[ew_start:e]
+                if rslice.empty:
+                    print(f"[{tag}]   window #{idx}: no risk data in horizon")
+                else:
+                    max_val = float(rslice.max())
+                    t_max = rslice.idxmax()
+                    print(f"[{tag}]   window #{idx}: max_risk={max_val:.4f} at {t_max}")
+    except Exception as exc:
+        print(f"[WARN] Risk diagnostics failed for tag {tag!r}: {exc}")
+
+    best_risk_threshold = float(best["threshold"])
+    risk_alarm_mask = (maintenance_risk >= best_risk_threshold).astype(bool)
     return best_risk_threshold, risk_alarm_mask, risk_results
 
 
@@ -398,31 +384,14 @@ def _run_single_model_experiment(
     pred_if, info = train_iforest_on_slices(
         X_train=X.loc[train_mask],
         X_all=X,
-        lpf_alpha=LPF_ALPHA,
         random_state=42,
     )
 
     pred = pred_if.copy()
 
     # Rolling maintenance risk from normalized risk scores (extreme-point exceedance)
-    if "risk_score" in pred.columns:
-        risk_base = pred["risk_score"].astype(float).fillna(0.0)
-        risk_base = (risk_base >= float(RISK_EXCEEDANCE_QUANTILE)).astype(float)
-    else:
-        score_for_risk = (
-            pred["anom_score_lpf"] if "anom_score_lpf" in pred.columns else pred["anom_score"]
-        ).astype(float).fillna(0.0)
-        tau = info.get("threshold")
-        if tau is None:
-            q3 = info.get("q3")
-            iqr = info.get("iqr")
-            if q3 is not None and iqr is not None:
-                tau = float(q3 + 3.0 * iqr)
-            else:
-                finite = score_for_risk.to_numpy()
-                finite = finite[np.isfinite(finite)]
-                tau = float(np.percentile(finite, 75)) if finite.size else 0.0
-        risk_base = (score_for_risk >= float(tau)).astype(float)
+    risk_base = pred["risk_score"].astype(float).fillna(0.0)
+    risk_base = (risk_base >= float(RISK_EXCEEDANCE_QUANTILE)).astype(float)
     maintenance_risk = _compute_segmented_risk(
         risk_base, [pd.Series(True, index=pred.index)]
     )
@@ -469,9 +438,7 @@ def _run_single_model_experiment(
     # Console summary
     total_pts = int(pred["is_anomaly"].sum())
     pct_pts = float(100.0 * pred["is_anomaly"].mean())
-    print(
-        f"[INFO] Model rule: {info['label_rule']}, features={info['n_features']}, LPF alpha={info['lpf_alpha']}"
-    )
+    print(f"[INFO] Model rule: {info['label_rule']}, features={info['n_features']}")
     print(f"[INFO] Train size: {info['n_train']}/{info['n_total']}")
     print(f"[INFO] Point anomalies: {total_pts} ({pct_pts:.2f}%)")
     if info.get("threshold") is not None:
@@ -490,7 +457,7 @@ def _run_per_maintenance_experiment(
     """
     Adaptive regime by maintenance cycles.
 
-    - Model 0 (pre-W1) is trained on the same earliest TRAIN_FRAC fraction of
+    - Model 0 (pre-W1) is trained on the same earliest TRAIN_FRAC minutes of
       the timeline as the single-model regime (chronological order), but with
       maintenance rows (operation_phase==2) excluded from the training set.
     - After each maintenance window W_j, we reserve a fixed amount of time
@@ -565,13 +532,10 @@ def _run_per_maintenance_experiment(
         slice_pred, info = train_iforest_on_slices(
             X_train=X_train,
             X_all=X_test,
-            lpf_alpha=LPF_ALPHA,
             random_state=42,
         )
 
         pred.loc[test_mask, "anom_score"] = slice_pred["anom_score"]
-        if "anom_score_lpf" in slice_pred.columns:
-            pred.loc[test_mask, "anom_score_lpf"] = slice_pred["anom_score_lpf"]
         pred.loc[test_mask, "is_anomaly"] = slice_pred["is_anomaly"]
         if "risk_score" in slice_pred.columns:
             pred.loc[test_mask, "risk_score"] = slice_pred["risk_score"]
@@ -745,7 +709,7 @@ def main() -> None:
         window_label_format=WINDOW_LABEL_FORMAT,
         risk_alarm_mask=risk_alarm_mask,
         risk_threshold=best_risk_threshold,
-        early_warning_minutes=EARLY_WARNING_MINUTES,
+        early_warning_minutes=PRE_MAINTENANCE_MINUTES,
     )
 
     # 4) Optional: save per-point predictions (timestamp, score, labels, risk)

@@ -66,38 +66,13 @@ def load_csv(input_path: str, timestamp_col: Optional[str], drop_unnamed: bool) 
 def select_numeric_features(
     df: pd.DataFrame,
     prefer: Optional[List[str]] = None,
-    exclude_quasi_binary: bool = True,
-    quasi_unique_threshold: int = 3
 ) -> List[str]:
     num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    if exclude_quasi_binary:
-        nb = []
-        for c in num_cols:
-            nunq = int(min(50_000, df[c].nunique(dropna=True)))
-            if nunq >= quasi_unique_threshold:
-                nb.append(c)
-        num_cols = nb
     if prefer:
         chosen = [c for c in prefer if c in num_cols]
         chosen += [c for c in num_cols if c not in chosen]
         return chosen
     return num_cols
-
-
-def pre_downsample(df: pd.DataFrame, rule: Optional[str]) -> pd.DataFrame:
-    if not rule:
-        return df
-    num = df.select_dtypes(include=[np.number])
-    agg = num.resample(rule).median()
-    return agg.dropna(how="all")
-
-
-def top_k_by_variance(df_num: pd.DataFrame, k: int) -> pd.DataFrame:
-    if k <= 0 or k >= df_num.shape[1]:
-        return df_num
-    vars_ = df_num.var(axis=0, skipna=True)
-    topk = vars_.sort_values(ascending=False).head(k).index.tolist()
-    return df_num[topk]
 
 
 def build_rolling_features(
@@ -186,7 +161,7 @@ def parse_maintenance_windows(
 def build_operation_phase(
     index: pd.DatetimeIndex,
     windows: List[Tuple],
-    pre_hours: float = 2.0,
+    pre_minutes: float = 120.0,
 ) -> pd.Series:
     """
     Build an operation phase indicator:
@@ -197,7 +172,7 @@ def build_operation_phase(
     if index.size == 0 or not windows:
         return phase
     try:
-        pre_delta = pd.to_timedelta(float(pre_hours), unit="h")
+        pre_delta = pd.to_timedelta(float(pre_minutes), unit="m")
     except Exception:
         pre_delta = pd.to_timedelta(0, unit="h")
 

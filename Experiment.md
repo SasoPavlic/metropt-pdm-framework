@@ -18,22 +18,14 @@ Opis je skladen s kodo in naj iz njega bralec razume, kako se podatki berejo, ka
 
 Program CSV prebere, `timestamp` uredi in nastavi kot indeks.
 
-### PRE_DOWNSAMPLE_RULE (opcijsko)
-`PRE_DOWNSAMPLE_RULE` je pravilo resamplinga (npr. `"60s"`). Ce je nastavljeno:
-- podatke agregiramo na enakomeren casovni korak,
-- v vsakem intervalu vzamemo median.
-
-To pomaga pri stabilnih rolling znacilkah in zmanjsa vpliv neenakomerne cadence.
-
 ### Izbor znacilk
-- vzamemo numericne stolpce,
-- lahko odstranimo kvazi-binarne signale,
-- izberemo `MAX_BASE_FEATURES` z najvecjo varianco.
+- vzamemo **vse numericne stolpce** (v MetroPT3 jih je 16),
+- stolpce uredimo po domenski preferenci (`LIKELY_METROPT_FEATURES`), ce so prisotni.
 
-Namen: zmanjsati dimenzionalnost in ohraniti najbolj informativne signale.
+Namen: ohraniti celoten nabor senzorjev brez dodatnega filtrov.
 
 ### Rolling znacilke
-Na izbranih signalih naredimo rolling statistike v oknu `ROLLING_WINDOW` (mean, std, min, max, skew ...). Rezultat je matrika `X`, ki jo dobijo modeli.
+Na vseh numericnih signalih naredimo rolling statistike v oknu `ROLLING_WINDOW` (mean, std, min, max, skew ...). Rezultat je matrika `X`, ki jo dobijo modeli.
 
 ---
 
@@ -41,7 +33,7 @@ Na izbranih signalih naredimo rolling statistike v oknu `ROLLING_WINDOW` (mean, 
 
 Maintenance okna so vzeta **iz clanka Davari et al. (2021)**. Vsak timestamp dobi fazo:
 - `operation_phase = 0` -> normalno stanje
-- `operation_phase = 1` -> pre-maintenance (npr. 2h pred servisom)
+- `operation_phase = 1` -> pre-maintenance (npr. 120 min pred servisom, `PRE_MAINTENANCE_MINUTES`)
 - `operation_phase = 2` -> maintenance (servis)
 
 Faze **niso vhod modela**, uporabljajo se samo za evaluacijo.
@@ -91,7 +83,7 @@ Event-level logika je zgrajena na **risk signalu**, ki meri gostoto ekstremnih t
 
 ### Event-level TP/FP/FN
 Za servis zacetek `start` in konec `end` velja okno:
-`[start - EARLY_WARNING_MINUTES, end]`
+`[start - PRE_MAINTENANCE_MINUTES, end]`
 
 - **TP**: alarm interval se s tem oknom **prekriva** (overlap)
 - **FN**: noben alarm se ne prekriva z oknom

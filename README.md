@@ -52,7 +52,9 @@ Command-line arguments are not required, but you can tweak configuration constan
 
 ### Output Interpretation
 - `operation_phase`: 0 normal, 1 within `PRE_MAINTENANCE_MINUTES` before a known maintenance start, 2 during maintenance.
+- `exceedance`: 1 when `risk_score >= RISK_EXCEEDANCE_QUANTILE`, otherwise 0.
 - `maintenance_risk`: fraction of the last `RISK_WINDOW_MINUTES` with extreme risk points (`risk_score >= RISK_EXCEEDANCE_QUANTILE`); higher values indicate sustained alarms and are compared against the risk threshold grid.
+- `predicted_phase`: 1 when `maintenance_risk >= θ` (alarm state), otherwise 0; `θ` is the best threshold from the risk grid.
 - `[METRIC]` console block: point-wise performance of `is_anomaly` when predicting pre-maintenance horizon (phase 1) vs normal operation (phase 0). Maintenance rows (phase 2) are ignored for these metrics.
 - `[RISK]` / `[RISK-PERMAINT]` console blocks: event-level performance of the rolling risk alarm (TP/FP/FN refer to maintenance events and alarm intervals, not individual rows).
 

@@ -25,6 +25,7 @@ from iforest_data import (
     parse_maintenance_windows,
     select_numeric_features,
 )
+from iforest_event_metrics import evaluate_maintenance_prediction, generate_results_table
 from iforest_metrics import confusion_and_scores, evaluate_risk_thresholds
 from iforest_model import train_iforest_on_slices, _time_based_train_mask
 from iforest_plotting import plot_raw_timeline
@@ -286,7 +287,7 @@ def _evaluate_risk_series(
 ) -> Tuple[Optional[float], Optional[pd.Series], List[dict]]:
     """Grid-search risk thresholds and print event-level metrics."""
     risk_thresholds: List[float] = []
-    risk_alarm_mask: Optional[pd.Series] = None
+    predicted_phase: Optional[pd.Series] = None
     best_risk_threshold: Optional[float] = None
 
     try:
@@ -295,7 +296,7 @@ def _evaluate_risk_series(
         print(f"[WARN] Skipping maintenance_risk evaluation: {exc}")
 
     if not risk_thresholds:
-        return best_risk_threshold, risk_alarm_mask, []
+        return best_risk_threshold, predicted_phase, []
 
     risk_results = evaluate_risk_thresholds(
         risk=maintenance_risk,
@@ -304,7 +305,7 @@ def _evaluate_risk_series(
         early_warning_minutes=PRE_MAINTENANCE_MINUTES,
     )
     if not risk_results:
-        return best_risk_threshold, risk_alarm_mask, []
+        return best_risk_threshold, predicted_phase, []
 
     print(
         f"[{tag}] Rolling window={RISK_WINDOW_MINUTES} min, "
@@ -323,49 +324,49 @@ def _evaluate_risk_series(
         f"TP={best['tp']}  FP={best['fp']}  FN={best['fn']}"
     )
 
-    # Diagnostics: for each failure window, show max risk inside the
-    # early-warning horizon. This helps understand why TP may be zero.
-    try:
-        horizon = pd.to_timedelta(float(max(0.0, PRE_MAINTENANCE_MINUTES)), unit="m")
-        windows: List[Tuple[pd.Timestamp, pd.Timestamp]] = []
-        for w in maint_windows or []:
-            if len(w) < 2:
-                continue
-            s = pd.to_datetime(w[0])
-            e = pd.to_datetime(w[1])
-            if pd.isna(s) or pd.isna(e) or e < s:
-                continue
-            windows.append((s, e))
-        if windows:
-            print(f"[{tag}] Per-window max risk within early-warning horizon:")
-            for idx, (s, e) in enumerate(windows, start=1):
-                ew_start = s - horizon
-                rslice = maintenance_risk.loc[ew_start:e]
-                if rslice.empty:
-                    print(f"[{tag}]   window #{idx}: no risk data in horizon")
-                else:
-                    max_val = float(rslice.max())
-                    t_max = rslice.idxmax()
-                    print(f"[{tag}]   window #{idx}: max_risk={max_val:.4f} at {t_max}")
-    except Exception as exc:
-        print(f"[WARN] Risk diagnostics failed for tag {tag!r}: {exc}")
-
     best_risk_threshold = float(best["threshold"])
-    risk_alarm_mask = (maintenance_risk >= best_risk_threshold).astype(bool)
-    return best_risk_threshold, risk_alarm_mask, risk_results
+    predicted_phase = (maintenance_risk >= best_risk_threshold).astype(bool)
+    return best_risk_threshold, predicted_phase, risk_results
 
 
 def _log_risk_summary(
     best_risk_threshold: Optional[float],
-    risk_alarm_mask: Optional[pd.Series],
+    predicted_phase: Optional[pd.Series],
 ) -> None:
-    if best_risk_threshold is None or risk_alarm_mask is None:
+    if best_risk_threshold is None or predicted_phase is None:
         return
-    coverage = float(risk_alarm_mask.mean() * 100.0) if len(risk_alarm_mask) else 0.0
+    coverage = float(predicted_phase.mean() * 100.0) if len(predicted_phase) else 0.0
     print(
         f"[INFO] Risk quantile={RISK_EXCEEDANCE_QUANTILE:.2f}, "
         f"alarm θ={best_risk_threshold:.2f}, coverage={coverage:.1f}%"
     )
+
+
+def _assign_predicted_phase(pred: pd.DataFrame, predicted_phase: Optional[pd.Series]) -> None:
+    if predicted_phase is None:
+        col = pd.Series(False, index=pred.index, dtype=bool)
+    else:
+        col = predicted_phase.reindex(pred.index).fillna(False).astype(bool)
+    col = col.astype(np.int8)
+    if "predicted_phase" in pred.columns:
+        pred["predicted_phase"] = col
+    elif "maintenance_risk" in pred.columns:
+        insert_at = pred.columns.get_loc("maintenance_risk") + 1
+        pred.insert(insert_at, "predicted_phase", col)
+    else:
+        pred["predicted_phase"] = col
+
+
+def _assign_exceedance(pred: pd.DataFrame) -> None:
+    """Add exceedance column based on risk_score and RISK_EXCEEDANCE_QUANTILE."""
+    if "risk_score" not in pred.columns:
+        return
+    exceedance = (pred["risk_score"].astype(float) >= float(RISK_EXCEEDANCE_QUANTILE)).astype(np.int8)
+    if "exceedance" in pred.columns:
+        pred["exceedance"] = exceedance
+    else:
+        insert_at = pred.columns.get_loc("risk_score") + 1
+        pred.insert(insert_at, "exceedance", exceedance)
 
 
 def _run_single_model_experiment(
@@ -408,10 +409,12 @@ def _run_single_model_experiment(
     eval_exclude_mask = initial_train_time_mask | post_maint_train_mask
 
     # Event-level evaluation of maintenance_risk thresholds
-    best_risk_threshold, risk_alarm_mask, _ = _evaluate_risk_series(
+    best_risk_threshold, predicted_phase, _ = _evaluate_risk_series(
         maintenance_risk, maint_windows, tag="RISK"
     )
-    _log_risk_summary(best_risk_threshold, risk_alarm_mask)
+    _log_risk_summary(best_risk_threshold, predicted_phase)
+    _assign_exceedance(pred)
+    _assign_predicted_phase(pred, predicted_phase)
 
     # Exact training cutoff timestamp on the prediction index
     train_cutoff_ts: Optional[pd.Timestamp] = None
@@ -435,6 +438,21 @@ def _run_single_model_experiment(
         f"F1={m_all['f1']:.4f}  Accuracy={m_all['accuracy']:.4f}"
     )
 
+    event_results = evaluate_maintenance_prediction(
+        predictions=pred["predicted_phase"],
+        maintenance_windows=maint_windows,
+        early_warning_minutes=PRE_MAINTENANCE_MINUTES,
+        method_name="Single",
+        eval_mask=eval_mask,
+        lead_step_minutes=30,
+    )
+    info["event_metrics"] = event_results
+    event_table = generate_results_table([event_results])
+    try:
+        print(event_table.to_markdown(index=False))
+    except Exception:
+        print(event_table.to_string(index=False))
+
     # Console summary
     total_pts = int(pred["is_anomaly"].sum())
     pct_pts = float(100.0 * pred["is_anomaly"].mean())
@@ -444,7 +462,7 @@ def _run_single_model_experiment(
     if info.get("threshold") is not None:
         print(f"[INFO] Train-based threshold: {info['threshold']:.4f}")
 
-    return pred, info, train_cutoff_ts, best_risk_threshold, risk_alarm_mask
+    return pred, info, train_cutoff_ts, best_risk_threshold, predicted_phase
 
 
 
@@ -636,10 +654,12 @@ def _run_per_maintenance_experiment(
     pred["operation_phase"] = op_phase
 
     # Event-level evaluation of maintenance_risk thresholds
-    best_risk_threshold, risk_alarm_mask, _ = _evaluate_risk_series(
+    best_risk_threshold, predicted_phase, _ = _evaluate_risk_series(
         maintenance_risk, mw_sorted, tag="RISK-PERMAINT"
     )
-    _log_risk_summary(best_risk_threshold, risk_alarm_mask)
+    _log_risk_summary(best_risk_threshold, predicted_phase)
+    _assign_exceedance(pred)
+    _assign_predicted_phase(pred, predicted_phase)
 
     # Point-wise metrics on rows with predictions (normal + pre-maintenance only),
     # excluding all training-only rows (initial slice + post-maint training days).
@@ -656,6 +676,20 @@ def _run_per_maintenance_experiment(
         f"F1={m_all['f1']:.4f}  Accuracy={m_all['accuracy']:.4f}"
     )
 
+    event_results = evaluate_maintenance_prediction(
+        predictions=pred["predicted_phase"],
+        maintenance_windows=mw_sorted,
+        early_warning_minutes=PRE_MAINTENANCE_MINUTES,
+        method_name="Per-maint",
+        eval_mask=eval_mask,
+        lead_step_minutes=30,
+    )
+    event_table = generate_results_table([event_results])
+    try:
+        print(event_table.to_markdown(index=False))
+    except Exception:
+        print(event_table.to_string(index=False))
+
     if period_infos:
         n_used = len(period_infos)
         min_train = min(info["train_size"] for info in period_infos)
@@ -669,7 +703,8 @@ def _run_per_maintenance_experiment(
         "mode": "per_maint",
         "n_segments": len(period_infos),
     }
-    return pred, summary_info, best_risk_threshold, risk_alarm_mask
+    summary_info["event_metrics"] = event_results
+    return pred, summary_info, best_risk_threshold, predicted_phase
 
 
 def main() -> None:
@@ -685,11 +720,11 @@ def main() -> None:
         )
 
     if mode == "single":
-        pred, info, train_cutoff_ts, best_risk_threshold, risk_alarm_mask = _run_single_model_experiment(
+        pred, info, train_cutoff_ts, best_risk_threshold, predicted_phase = _run_single_model_experiment(
             X, maint_windows, operation_phase
         )
     else:
-        pred, info, best_risk_threshold, risk_alarm_mask = _run_per_maintenance_experiment(
+        pred, info, best_risk_threshold, predicted_phase = _run_per_maintenance_experiment(
             X, maint_windows, operation_phase
         )
         train_cutoff_ts = None
@@ -707,7 +742,7 @@ def main() -> None:
         show_window_labels=effective_show_labels,
         window_label_fontsize=WINDOW_LABEL_FONTSIZE,
         window_label_format=WINDOW_LABEL_FORMAT,
-        risk_alarm_mask=risk_alarm_mask,
+        predicted_phase=predicted_phase,
         risk_threshold=best_risk_threshold,
         early_warning_minutes=PRE_MAINTENANCE_MINUTES,
     )

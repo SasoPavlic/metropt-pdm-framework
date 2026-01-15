@@ -182,7 +182,9 @@ baseline + post-maint_2 --> model C --> scoring gap_2
 
 Rezultat v obeh rezimih:
 - `is_anomaly` za vsako vrstico (point-wise)
+- `exceedance` = 1, ce `risk_score` preseze kvantil `RISK_EXCEEDANCE_QUANTILE`
 - `maintenance_risk` za casovno okno (collective)
+- `predicted_phase` = 1, ce `maintenance_risk >= θ` (alarmno stanje), sicer 0
 - TP/FP/FN/TN (point-wise) in TP/FP/FN (event-level)
 
 ## Grafi (trenutni zagon)

@@ -23,7 +23,7 @@ def plot_raw_timeline(
         show_window_labels: bool = True,
         window_label_fontsize: int = 9,
         window_label_format: str = "{id}",
-        risk_alarm_mask: Optional[pd.Series] = None,
+        predicted_phase: Optional[pd.Series] = None,
         risk_threshold: Optional[float] = None,
         early_warning_minutes: float = 120.0,
 ):
@@ -33,8 +33,8 @@ def plot_raw_timeline(
         raise ValueError("maintenance_risk column required for plotting.")
 
     state = (
-        risk_alarm_mask.reindex(df_plot.index).fillna(0).astype(bool)
-        if risk_alarm_mask is not None
+        predicted_phase.reindex(df_plot.index).fillna(0).astype(bool)
+        if predicted_phase is not None
         else pd.Series(False, index=df_plot.index)
     )
 

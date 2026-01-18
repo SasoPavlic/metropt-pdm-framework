@@ -35,7 +35,7 @@ matplotlib
    ```
 3. Run the helper script:
    ```bash
-   python anomaly_iforest_helper.py
+   python pipeline_runner.py
    ```
    The script will emit `[INFO]`, `[METRIC]`, and `[RISK]` summaries, produce `metropt3_iforest_pred.csv`, and save the timeline plot to `metropt3_iforest_raw.png`.
 

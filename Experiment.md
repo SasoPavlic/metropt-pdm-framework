@@ -190,7 +190,7 @@ Rezultat v obeh rezimih:
 ## Grafi (trenutni zagon)
 
 ### Per-maintenance
-![Per-maint risk timeline](per_maint_metropt3_iforest_raw.png)
+![Per-maint risk timeline](per_maint_metropt3_raw.png)
 
 ### Single
-![Single risk timeline](single_metropt3_iforest_raw.png)
+![Single risk timeline](single_metropt3_raw.png)

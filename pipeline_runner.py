@@ -18,17 +18,17 @@ from typing import List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from iforest_data import (
+from data_utils import (
     build_operation_phase,
     build_rolling_features,
     load_csv,
     parse_maintenance_windows,
     select_numeric_features,
 )
-from iforest_event_metrics import evaluate_maintenance_prediction, generate_results_table
-from iforest_metrics import confusion_and_scores, evaluate_risk_thresholds
-from iforest_model import train_iforest_on_slices, _time_based_train_mask
-from iforest_plotting import plot_raw_timeline
+from metrics_event import evaluate_maintenance_prediction, generate_results_table
+from metrics_point import confusion_and_scores, evaluate_risk_thresholds
+from detector_model import train_iforest_on_slices, _time_based_train_mask
+from plotting import plot_raw_timeline
 
 
 def parse_risk_grid_spec(spec: str) -> List[float]:
@@ -58,15 +58,15 @@ INPUT_TIMESTAMP_COL: Optional[str] = None
 DROP_UNNAMED_INDEX: bool = True
 # Input/outputs
 INPUT_PATH: str = "MetroPT3.csv"
-SAVE_FIG_PATH: Optional[str] = "metropt3_iforest_raw.png"
-SAVE_PRED_CSV_PATH: Optional[str] = "metropt3_iforest_pred.csv"
-SAVE_FEATURES_CSV_PATH: Optional[str] = "metropt3_iforest_features.csv"
+SAVE_FIG_PATH: Optional[str] = "metropt3_raw.png"
+SAVE_PRED_CSV_PATH: Optional[str] = "metropt3_predictions.csv"
+SAVE_FEATURES_CSV_PATH: Optional[str] = "metropt3_features.csv"
 
 # Experiment mode:
 # - "single": one global model trained once on an early slice.
 # - "per_maint": per-maintenance models trained on fixed post-maintenance
 #   training days for each cycle (plus an initial pre-W1 model).
-EXPERIMENT_MODE: str = "single"
+EXPERIMENT_MODE: str = "per_maint"
 
 # Rolling window for feature aggregation (e.g., '600s' = 10 minutes).
 ROLLING_WINDOW: str = "60s"

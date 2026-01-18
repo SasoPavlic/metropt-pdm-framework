@@ -13,6 +13,7 @@ Single-series anomaly explorer (native timeline plot, MetroPT-3).
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -48,6 +49,16 @@ def parse_risk_grid_spec(spec: str) -> List[float]:
     return values
 
 
+def _mode_output_path(path: Optional[str], mode: str) -> Optional[str]:
+    """Prefix output filename with the experiment mode while preserving directory."""
+    if not path:
+        return None
+    p = Path(path)
+    if p.suffix:
+        return str(p.with_name(f"{mode}_{p.name}"))
+    return str(p / f"{mode}.png")
+
+
 # -----------------------------
 # Configuration constants
 # -----------------------------
@@ -58,7 +69,7 @@ INPUT_TIMESTAMP_COL: Optional[str] = None
 DROP_UNNAMED_INDEX: bool = True
 # Input/outputs
 INPUT_PATH: str = "datasets/MetroPT3.csv"
-SAVE_FIG_PATH: Optional[str] = "metropt3_raw.png"
+SAVE_FIG_PATH: Optional[str] = "plots/metropt3_raw.png"
 SAVE_PRED_CSV_PATH: Optional[str] = "datasets/metropt3_predictions.csv"
 SAVE_FEATURES_CSV_PATH: Optional[str] = "datasets/metropt3_features.csv"
 
@@ -733,10 +744,13 @@ def main() -> None:
     df_plot = pred[["maintenance_risk"]].copy()
 
     effective_show_labels = bool(SHOW_WINDOW_LABELS or USE_DEFAULT_METROPT_WINDOWS)
+    save_fig_path = _mode_output_path(SAVE_FIG_PATH, EXPERIMENT_MODE)
+    if save_fig_path:
+        Path(save_fig_path).parent.mkdir(parents=True, exist_ok=True)
     plot_raw_timeline(
         df_plot,
         maint_windows,
-        save_fig=EXPERIMENT_MODE + '_' + SAVE_FIG_PATH,
+        save_fig=save_fig_path,
         train_frac=TRAIN_FRAC if mode == "single" else None,
         train_cutoff_time=train_cutoff_ts,
         show_window_labels=effective_show_labels,

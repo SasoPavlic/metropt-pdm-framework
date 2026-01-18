@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Single-series IsolationForest anomaly explorer (native timeline plot, MetroPT-3).
+Single-series anomaly explorer (native timeline plot, MetroPT-3).
 
 - Loads CSV/TXT specific to this project (no MAT/Parquet to keep it simple).
 - Rolling stats over all numeric features.
 - Train on the first N minutes (chronological), score all points.
-- Label by a robust (Q3 + 3*IQR) threshold on IF scores.
+- Label by a robust (Q3 + 3*IQR) threshold on model scores.
 - Plot ORIGINAL timeline with point colors (normal/anomalous) + shaded/marked failure windows with labels.
 """
 
@@ -57,10 +57,10 @@ INPUT_TIMESTAMP_COL: Optional[str] = None
 # Whether to drop unnamed index columns commonly created by pandas when saving CSVs.
 DROP_UNNAMED_INDEX: bool = True
 # Input/outputs
-INPUT_PATH: str = "MetroPT3.csv"
+INPUT_PATH: str = "datasets/MetroPT3.csv"
 SAVE_FIG_PATH: Optional[str] = "metropt3_raw.png"
-SAVE_PRED_CSV_PATH: Optional[str] = "metropt3_predictions.csv"
-SAVE_FEATURES_CSV_PATH: Optional[str] = "metropt3_features.csv"
+SAVE_PRED_CSV_PATH: Optional[str] = "datasets/metropt3_predictions.csv"
+SAVE_FEATURES_CSV_PATH: Optional[str] = "datasets/metropt3_features.csv"
 
 # Experiment mode:
 # - "single": one global model trained once on an early slice.
@@ -374,7 +374,7 @@ def _run_single_model_experiment(
     maint_windows: List[Tuple],
     operation_phase: pd.Series,
 ) -> Tuple[pd.DataFrame, dict, Optional[pd.Timestamp], Optional[float], Optional[pd.Series]]:
-    """Baseline: single global IF model trained once and scored over the full timeline."""
+    """Baseline: single global model trained once and scored over the full timeline."""
     # Time-based training window, restricted to non-maintenance rows (phases 0/1)
     train_time_mask = _time_based_train_mask(X.index, TRAIN_FRAC)
     op_phase = operation_phase.reindex(X.index).astype(np.int8)
@@ -525,7 +525,7 @@ def _run_per_maintenance_experiment(
         f"(pre-W1 plus one cycle per maintenance window)"
     )
 
-    # Helper: fit IF on X_train and score X_test; update per-point predictions.
+    # Helper: fit the detector on X_train and score X_test; update per-point predictions.
     def _fit_and_score_segment(
         seg_label: str, train_mask: pd.Series, test_mask: pd.Series
     ) -> Optional[dict]:

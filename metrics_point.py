@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Metrics helpers for the IsolationForest anomaly helper.
+Point-wise and risk-grid metrics for the anomaly detection pipeline.
 """
 
 from __future__ import annotations

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Data loading and preprocessing utilities for the IsolationForest anomaly helper.
+Data loading and preprocessing utilities for the anomaly detection pipeline.
 """
 
 from __future__ import annotations

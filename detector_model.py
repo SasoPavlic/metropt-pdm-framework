@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Modeling utilities for the IsolationForest anomaly helper.
+Modeling utilities for the anomaly detection pipeline.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ def _train_iforest_core(
     random_state: int,
 ) -> Tuple[pd.DataFrame, dict]:
     """
-    Fit IsolationForest on X_train and score X_all using a shared scaler.
+    Fit the detector on X_train and score X_all using a shared scaler.
 
     Threshold is derived from the training scores only (Q3 + 3*IQR) and then
     applied to all scored points in X_all.
@@ -131,7 +131,7 @@ def train_iforest_and_score(
     If the time window yields too few rows, fall back to the first `min_rows`.
     """
     if len(X) < 2:
-        raise ValueError("Need at least 2 samples to train IsolationForest.")
+        raise ValueError("Need at least 2 samples to train the detector.")
     train_mask = _time_based_train_mask(X.index, train_minutes=train_minutes)
     X_train = X.loc[train_mask]
     if X_train.shape[0] < 2:
@@ -145,7 +145,7 @@ def train_iforest_on_slices(
     random_state: int = 42,
 ) -> Tuple[pd.DataFrame, dict]:
     """
-    Train IsolationForest on an arbitrary training slice and score an arbitrary
+    Train the detector on an arbitrary training slice and score an arbitrary
     (typically disjoint) slice X_all that shares the same feature schema.
     """
     return _train_iforest_core(X_train, X_all, random_state=random_state)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Plotting helpers for the IsolationForest anomaly helper.
+Plotting helpers for the anomaly detection pipeline.
 """
 
 from __future__ import annotations

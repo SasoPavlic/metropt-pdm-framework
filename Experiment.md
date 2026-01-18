@@ -1,6 +1,6 @@
-## MetroPT-IForest Experimenti (opis workflowa)
+## MetroPT PdM Framework – Experimenti (opis workflowa)
 
-Dokument opisuje trenutni workflow v repozitoriju MetroPT-IF-model in dve rezimi ucenja:
+Dokument opisuje trenutni workflow v repozitoriju metropt-pdm-framework in dve rezimi ucenja:
 - **single** (en globalni model)
 - **per_maint** (adaptivni model po servisih)
 
@@ -11,7 +11,7 @@ Opis je skladen s kodo in naj iz njega bralec razume, kako se podatki berejo, ka
 ## 1) Branje in priprava podatkov
 
 ### Kakrsni so podatki
-`MetroPT3.csv` vsebuje casovne vrste iz APU sistema tramvaja. Stolpci so:
+`datasets/MetroPT3.csv` vsebuje casovne vrste iz APU sistema tramvaja. Stolpci so:
 - analogni senzorji (npr. tlaki, temperature, tokovi),
 - binarni/kvazi-binarni signali (0/1),
 - `timestamp` (casovni zig).
@@ -25,7 +25,7 @@ Program CSV prebere, `timestamp` uredi in nastavi kot indeks.
 Namen: ohraniti celoten nabor senzorjev brez dodatnega filtrov.
 
 ### Rolling znacilke
-Na vseh numericnih signalih naredimo rolling statistike v oknu `ROLLING_WINDOW` (mean, std, min, max, skew ...). Rezultat je matrika `X`, ki jo dobijo modeli.
+Na vseh numericnih signalih naredimo rolling statistike v oknu `ROLLING_WINDOW` (mean, std, min, max, skew ...). Rezultat je matrika `X`, ki jo dobijo modeli. Implementacija je v `data_utils.py`.
 
 ---
 
@@ -45,7 +45,7 @@ Faze **niso vhod modela**, uporabljajo se samo za evaluacijo.
 ## A) Point-wise anomalije (po vrstici)
 Model vsaki vrstici dodeli `is_anomaly` (0/1):
 - `is_anomaly = 1`, ce je `anom_score >= threshold`
-- `threshold = Q3 + 3*IQR` iz **ucnih** score-ov
+- `threshold = Q3 + 3*IQR` iz **ucnih** score-ov (v `detector_model.py`)
 
 ### Point-wise evaluacija
 V evaluacijo gredo samo faze 0 in 1:
@@ -92,7 +92,7 @@ Za servis zacetek `start` in konec `end` velja okno:
 
 ---
 
-# Rezim A: Single model (`EXPERIMENT_MODE="single"`)
+# Rezim A: Single model (`EXPERIMENT_MODE="single"`) – `pipeline_runner.py`
 
 ## Ucenje
 - model se uci na prvih `TRAIN_FRAC` minutah (trenutno 1440 min)
@@ -108,7 +108,7 @@ Za servis zacetek `start` in konec `end` velja okno:
 
 ---
 
-# Rezim B: Per-maintenance (`EXPERIMENT_MODE="per_maint"`)
+# Rezim B: Per-maintenance (`EXPERIMENT_MODE="per_maint"`) – `pipeline_runner.py`
 
 ## Globalni baseline
 - baseline = zacetni `TRAIN_FRAC` interval (brez phase=2)
@@ -190,7 +190,7 @@ Rezultat v obeh rezimih:
 ## Grafi (trenutni zagon)
 
 ### Per-maintenance
-![Per-maint risk timeline](per_maint_metropt3_raw.png)
+![Per-maint risk timeline](plots/per_maint_metropt3_raw.png)
 
 ### Single
-![Single risk timeline](single_metropt3_raw.png)
+![Single risk timeline](plots/single_metropt3_raw.png)

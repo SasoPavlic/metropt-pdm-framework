@@ -26,10 +26,10 @@ from data_utils import (
     parse_maintenance_windows,
     select_numeric_features,
 )
-from metrics_event import evaluate_maintenance_prediction, generate_results_table
+from metrics_event import evaluate_maintenance_prediction
 from metrics_point import confusion_and_scores, evaluate_risk_thresholds
 from detector_model import train_iforest_on_slices, _time_based_train_mask
-from plotting import plot_raw_timeline
+from plotting import plot_raw_timeline, plot_lead_time_distribution, plot_pr_vs_lead_time
 
 
 def parse_risk_grid_spec(spec: str) -> List[float]:
@@ -59,6 +59,13 @@ def _mode_output_path(path: Optional[str], mode: str) -> Optional[str]:
     return str(p / f"{mode}.png")
 
 
+def _print_section(title: str) -> None:
+    bar = "=" * 60
+    print(f"\n{bar}")
+    print(title)
+    print(bar)
+
+
 # -----------------------------
 # Configuration constants
 # -----------------------------
@@ -70,6 +77,8 @@ DROP_UNNAMED_INDEX: bool = True
 # Input/outputs
 INPUT_PATH: str = "datasets/MetroPT3.csv"
 SAVE_FIG_PATH: Optional[str] = "plots/metropt3_raw.png"
+SAVE_LEAD_TIME_DIST_PATH: Optional[str] = "plots/lead_time_distribution.png"
+SAVE_PR_LEADTIME_PATH: Optional[str] = "plots/pr_vs_lead_time.png"
 SAVE_PRED_CSV_PATH: Optional[str] = "datasets/metropt3_predictions.csv"
 SAVE_FEATURES_CSV_PATH: Optional[str] = "datasets/metropt3_features.csv"
 
@@ -90,6 +99,8 @@ RISK_WINDOW_MINUTES: int = 480
 RISK_EXCEEDANCE_QUANTILE: float = 0.95
 # Risk evaluation grid specification (start:stop:step).
 RISK_EVAL_GRID_SPEC: str = "0.30:0.90:0.10"
+# Lead-time step size for event-level curves (minutes).
+LEAD_STEP_MINUTES: int = 10
 # Length of the post-maintenance training interval (in minutes) for the
 # per-maintenance regime. For each maintenance window W_j, the next model
 # (if any) is trained on the interval [end_j, end_j + POST_MAINT_TRAIN_MINUTES),
@@ -295,11 +306,12 @@ def _evaluate_risk_series(
     maintenance_risk: pd.Series,
     maint_windows: List[Tuple],
     tag: str,
-) -> Tuple[Optional[float], Optional[pd.Series], List[dict]]:
-    """Grid-search risk thresholds and print event-level metrics."""
+) -> Tuple[Optional[float], Optional[pd.Series], List[dict], Optional[dict]]:
+    """Grid-search risk thresholds and return best stats."""
     risk_thresholds: List[float] = []
     predicted_phase: Optional[pd.Series] = None
     best_risk_threshold: Optional[float] = None
+    best_stats: Optional[dict] = None
 
     try:
         risk_thresholds = parse_risk_grid_spec(RISK_EVAL_GRID_SPEC)
@@ -307,7 +319,7 @@ def _evaluate_risk_series(
         print(f"[WARN] Skipping maintenance_risk evaluation: {exc}")
 
     if not risk_thresholds:
-        return best_risk_threshold, predicted_phase, []
+        return best_risk_threshold, predicted_phase, [], best_stats
 
     risk_results = evaluate_risk_thresholds(
         risk=maintenance_risk,
@@ -316,41 +328,13 @@ def _evaluate_risk_series(
         early_warning_minutes=PRE_MAINTENANCE_MINUTES,
     )
     if not risk_results:
-        return best_risk_threshold, predicted_phase, []
-
-    print(
-        f"[{tag}] Rolling window={RISK_WINDOW_MINUTES} min, "
-        f"early-warning horizon={PRE_MAINTENANCE_MINUTES} min"
-    )
-    for res in risk_results:
-        print(
-            f"[{tag}] θ={res['threshold']:.2f}  Precision={res['precision']:.4f}  "
-            f"Recall={res['recall']:.4f}  F1={res['f1']:.4f}  TP={res['tp']}  FP={res['fp']}  FN={res['fn']}"
-        )
+        return best_risk_threshold, predicted_phase, [], best_stats
 
     best = max(risk_results, key=lambda r: (r["f1"], r["precision"], -r["threshold"]))
-    print(
-        f"[{tag}] Best θ={best['threshold']:.2f}: Precision={best['precision']:.4f}  "
-        f"Recall={best['recall']:.4f}  F1={best['f1']:.4f}  "
-        f"TP={best['tp']}  FP={best['fp']}  FN={best['fn']}"
-    )
-
+    best_stats = dict(best)
     best_risk_threshold = float(best["threshold"])
     predicted_phase = (maintenance_risk >= best_risk_threshold).astype(bool)
-    return best_risk_threshold, predicted_phase, risk_results
-
-
-def _log_risk_summary(
-    best_risk_threshold: Optional[float],
-    predicted_phase: Optional[pd.Series],
-) -> None:
-    if best_risk_threshold is None or predicted_phase is None:
-        return
-    coverage = float(predicted_phase.mean() * 100.0) if len(predicted_phase) else 0.0
-    print(
-        f"[INFO] Risk quantile={RISK_EXCEEDANCE_QUANTILE:.2f}, "
-        f"alarm θ={best_risk_threshold:.2f}, coverage={coverage:.1f}%"
-    )
+    return best_risk_threshold, predicted_phase, risk_results, best_stats
 
 
 def _assign_predicted_phase(pred: pd.DataFrame, predicted_phase: Optional[pd.Series]) -> None:
@@ -378,6 +362,123 @@ def _assign_exceedance(pred: pd.DataFrame) -> None:
     else:
         insert_at = pred.columns.get_loc("risk_score") + 1
         pred.insert(insert_at, "exceedance", exceedance)
+
+
+def _print_pointwise_metrics(label: str, metrics: dict, threshold_info: Optional[str] = None) -> None:
+    _print_section(f"POINT-WISE METRICS ({label})")
+    if threshold_info:
+        print(f"Threshold: {threshold_info}")
+    print(
+        f"TP={metrics['TP']}  FP={metrics['FP']}  FN={metrics['FN']}  TN={metrics['TN']}"
+    )
+    print(
+        f"Precision={metrics['precision']:.4f}  Recall={metrics['recall']:.4f}  "
+        f"F1={metrics['f1']:.4f}  Accuracy={metrics['accuracy']:.4f}"
+    )
+
+
+def _print_event_level_metrics(
+    label: str,
+    best_stats: Optional[dict],
+    risk_results: List[dict],
+) -> None:
+    _print_section(f"EVENT-LEVEL METRICS ({label})")
+    print(
+        f"Risk window={RISK_WINDOW_MINUTES} min  |  "
+        f"Pre-maint horizon={PRE_MAINTENANCE_MINUTES} min  |  "
+        f"Exceedance quantile={RISK_EXCEEDANCE_QUANTILE:.2f}"
+    )
+    if best_stats:
+        print(
+            f"Best θ={best_stats['threshold']:.2f}  "
+            f"TP={best_stats['tp']}  FP={best_stats['fp']}  FN={best_stats['fn']}  "
+            f"Precision={best_stats['precision']:.4f}  "
+            f"Recall={best_stats['recall']:.4f}  F1={best_stats['f1']:.4f}"
+        )
+    else:
+        print("Best θ=N/A (no risk results)")
+
+
+def _print_event_extra_metrics(label: str, event_results: dict) -> None:
+    _print_section(f"ADDITIONAL EVENT METRICS ({label})")
+    ttd = event_results.get("ttd", {})
+    faa = event_results.get("first_alarm_accuracy", {})
+    far = event_results.get("far", {})
+    cov = event_results.get("coverage", {})
+    mtia = event_results.get("mtia", {})
+    pr = event_results.get("pr_leadtime", {})
+
+    if ttd.get("mean_ttd") is not None:
+        print(
+            f"TTD mean={ttd['mean_ttd']:.1f} min (std={ttd['std_ttd']:.1f}, "
+            f"min={ttd['min_ttd']:.1f}, max={ttd['max_ttd']:.1f})"
+        )
+    else:
+        print("TTD mean=N/A (no detections)")
+    print(f"TTD detected={ttd.get('detected_events', 0)} missed={ttd.get('missed_events', 0)}")
+
+    if faa.get("first_alarm_accuracy") is not None:
+        print(
+            f"FAA={faa['first_alarm_accuracy']:.3f} "
+            f"({faa['first_alarm_in_window']}/{faa['tp_events']})"
+        )
+    else:
+        print("FAA=N/A")
+
+    if cov:
+        print(
+            f"Coverage={cov['alarm_coverage_percent']:.2f}% "
+            f"({cov['alarm_points']}/{cov['total_points']})"
+        )
+
+    if mtia.get("mtia_minutes") is not None:
+        print(
+            f"MTIA mean={mtia['mtia_minutes']:.1f} min "
+            f"(std={mtia['std_minutes']:.1f}, intervals={mtia['num_intervals']})"
+        )
+    else:
+        print("MTIA mean=N/A (no alarm intervals)")
+
+    if far.get("far_per_week") is not None:
+        print(
+            f"FAR per_day={far['far_per_day']:.3f}  "
+            f"per_week={far['far_per_week']:.3f}  "
+            f"FP intervals={far['fp_intervals']}"
+        )
+
+    if pr:
+        print("PR vs Lead Time:")
+        for i, lt in enumerate(pr.get("lead_times", [])):
+            print(
+                f"  {lt} min: P={pr['precision'][i]:.3f}, "
+                f"R={pr['recall'][i]:.3f}, F1={pr['f1'][i]:.3f}"
+            ) 
+
+
+def _save_event_plots(event_results: dict, mode: str) -> None:
+    if not event_results:
+        return
+    dist = event_results.get("lead_time_distribution", {})
+    pr = event_results.get("pr_leadtime", {})
+
+    dist_path = _mode_output_path(SAVE_LEAD_TIME_DIST_PATH, mode)
+    pr_path = _mode_output_path(SAVE_PR_LEADTIME_PATH, mode)
+
+    if dist_path:
+        Path(dist_path).parent.mkdir(parents=True, exist_ok=True)
+        plot_lead_time_distribution(
+            dist,
+            save_fig=dist_path,
+            title=f"Lead Time Distribution ({mode})",
+        )
+
+    if pr_path:
+        Path(pr_path).parent.mkdir(parents=True, exist_ok=True)
+        plot_pr_vs_lead_time(
+            pr,
+            save_fig=pr_path,
+            title=f"Precision-Recall vs Lead Time ({mode})",
+        )
 
 
 def _run_single_model_experiment(
@@ -420,10 +521,9 @@ def _run_single_model_experiment(
     eval_exclude_mask = initial_train_time_mask | post_maint_train_mask
 
     # Event-level evaluation of maintenance_risk thresholds
-    best_risk_threshold, predicted_phase, _ = _evaluate_risk_series(
+    best_risk_threshold, predicted_phase, risk_results, best_stats = _evaluate_risk_series(
         maintenance_risk, maint_windows, tag="RISK"
     )
-    _log_risk_summary(best_risk_threshold, predicted_phase)
     _assign_exceedance(pred)
     _assign_predicted_phase(pred, predicted_phase)
 
@@ -437,17 +537,13 @@ def _run_single_model_experiment(
 
     # Point-wise metrics on normal + pre-maintenance, excluding training-only rows
     eval_mask = ~eval_exclude_mask
-    m_all = _compute_pointwise_metrics(
-        pred["is_anomaly"], pred["operation_phase"], eval_mask=eval_mask
-    )
-    print("[METRIC] Single-model (all evaluated rows):")
-    print(
-        f"         TP={m_all['TP']}  FP={m_all['FP']}  FN={m_all['FN']}  TN={m_all['TN']}"
-    )
-    print(
-        f"         Precision={m_all['precision']:.4f}  Recall={m_all['recall']:.4f}  "
-        f"F1={m_all['f1']:.4f}  Accuracy={m_all['accuracy']:.4f}"
-    )
+    m_all = _compute_pointwise_metrics(pred["is_anomaly"], pred["operation_phase"], eval_mask=eval_mask)
+    threshold_info = None
+    if info.get("threshold") is not None:
+        threshold_info = f"{info.get('label_rule')} | value={info['threshold']:.4f}"
+    _print_pointwise_metrics("Single", m_all, threshold_info=threshold_info)
+
+    _print_event_level_metrics("Single", best_stats, risk_results)
 
     event_results = evaluate_maintenance_prediction(
         predictions=pred["predicted_phase"],
@@ -455,14 +551,11 @@ def _run_single_model_experiment(
         early_warning_minutes=PRE_MAINTENANCE_MINUTES,
         method_name="Single",
         eval_mask=eval_mask,
-        lead_step_minutes=30,
+        lead_step_minutes=LEAD_STEP_MINUTES,
     )
     info["event_metrics"] = event_results
-    event_table = generate_results_table([event_results])
-    try:
-        print(event_table.to_markdown(index=False))
-    except Exception:
-        print(event_table.to_string(index=False))
+    _print_event_extra_metrics("Single", event_results)
+    _save_event_plots(event_results, mode="single")
 
     # Console summary
     total_pts = int(pred["is_anomaly"].sum())
@@ -553,10 +646,6 @@ def _run_per_maintenance_experiment(
         if X_train.shape[0] < 2 or X_test.shape[0] < 2:
             return None
 
-        print(
-            f"[INFO] Per-maint segment {seg_label}: "
-            f"train_size={X_train.shape[0]}, test_size={X_test.shape[0]}"
-        )
 
         slice_pred, info = train_iforest_on_slices(
             X_train=X_train,
@@ -665,27 +754,26 @@ def _run_per_maintenance_experiment(
     pred["operation_phase"] = op_phase
 
     # Event-level evaluation of maintenance_risk thresholds
-    best_risk_threshold, predicted_phase, _ = _evaluate_risk_series(
+    best_risk_threshold, predicted_phase, risk_results, best_stats = _evaluate_risk_series(
         maintenance_risk, mw_sorted, tag="RISK-PERMAINT"
     )
-    _log_risk_summary(best_risk_threshold, predicted_phase)
     _assign_exceedance(pred)
     _assign_predicted_phase(pred, predicted_phase)
 
     # Point-wise metrics on rows with predictions (normal + pre-maintenance only),
     # excluding all training-only rows (initial slice + post-maint training days).
     eval_mask = pred["is_anomaly"].notna() & (~global_train_for_eval)
-    m_all = _compute_pointwise_metrics(
-        pred["is_anomaly"], pred["operation_phase"], eval_mask=eval_mask
-    )
-    print("[METRIC] Per-maint-model (all evaluated rows across periods):")
-    print(
-        f"         TP={m_all['TP']}  FP={m_all['FP']}  FN={m_all['FN']}  TN={m_all['TN']}"
-    )
-    print(
-        f"         Precision={m_all['precision']:.4f}  Recall={m_all['recall']:.4f}  "
-        f"F1={m_all['f1']:.4f}  Accuracy={m_all['accuracy']:.4f}"
-    )
+    m_all = _compute_pointwise_metrics(pred["is_anomaly"], pred["operation_phase"], eval_mask=eval_mask)
+    threshold_info = None
+    thresholds = [info["threshold"] for info in period_infos if info.get("threshold") is not None]
+    if thresholds:
+        threshold_info = (
+            f"per-segment thresholds: min={min(thresholds):.4f}, "
+            f"max={max(thresholds):.4f}, mean={np.mean(thresholds):.4f}"
+        )
+    _print_pointwise_metrics("Per-maint", m_all, threshold_info=threshold_info)
+
+    _print_event_level_metrics("Per-maint", best_stats, risk_results)
 
     event_results = evaluate_maintenance_prediction(
         predictions=pred["predicted_phase"],
@@ -693,13 +781,10 @@ def _run_per_maintenance_experiment(
         early_warning_minutes=PRE_MAINTENANCE_MINUTES,
         method_name="Per-maint",
         eval_mask=eval_mask,
-        lead_step_minutes=30,
+        lead_step_minutes=LEAD_STEP_MINUTES,
     )
-    event_table = generate_results_table([event_results])
-    try:
-        print(event_table.to_markdown(index=False))
-    except Exception:
-        print(event_table.to_string(index=False))
+    _print_event_extra_metrics("Per-maint", event_results)
+    _save_event_plots(event_results, mode="per_maint")
 
     if period_infos:
         n_used = len(period_infos)
@@ -768,26 +853,36 @@ def main() -> None:
         out.to_csv(SAVE_PRED_CSV_PATH)
 
     if maint_windows:
-        def _fmt_win(w):
+        rows = []
+        for w in maint_windows:
             try:
                 if len(w) >= 4:
                     s, e, wid, sev = w[0], w[1], w[2], w[3]
                 else:
                     s, e = w[0], w[1]
                     wid, sev = None, None
-                dur_min = int(round(max(0.0, (pd.to_datetime(e) - pd.to_datetime(s)).total_seconds() / 60.0)))
-                label = f"{pd.to_datetime(s)} → {pd.to_datetime(e)}"
-                meta = []
-                if wid:
-                    meta.append(str(wid))
-                if sev:
-                    meta.append(str(sev))
-                meta.append(f"{dur_min}min")
-                return f"{label} ({', '.join(meta)})"
+                start = pd.to_datetime(s)
+                end = pd.to_datetime(e)
+                dur_min = int(round(max(0.0, (end - start).total_seconds() / 60.0)))
+                rows.append(
+                    {
+                        "id": str(wid) if wid is not None else "",
+                        "severity": str(sev) if sev is not None else "",
+                        "start": start,
+                        "end": end,
+                        "duration_min": dur_min,
+                    }
+                )
             except Exception:
-                return str(w)
-
-        print("[INFO] Failure windows:", [_fmt_win(w) for w in maint_windows])
+                rows.append(
+                    {"id": "", "severity": "", "start": "", "end": "", "duration_min": ""}
+                )
+        print("[INFO] Failure windows:")
+        df_windows = pd.DataFrame(rows, columns=["id", "severity", "start", "end", "duration_min"])
+        try:
+            print(df_windows.to_markdown(index=False))
+        except Exception:
+            print(df_windows.to_string(index=False))
 
 
 if __name__ == "__main__":

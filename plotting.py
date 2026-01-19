@@ -10,6 +10,7 @@ from typing import List, Optional, Tuple
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 from matplotlib.patches import Patch
 
@@ -195,3 +196,88 @@ def plot_raw_timeline(
     fig.tight_layout()
     if save_fig:
         fig.savefig(save_fig, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_lead_time_distribution(
+        dist: dict,
+        save_fig: Optional[str],
+        title: Optional[str] = None,
+):
+    """Plot histogram of lead-time-to-detection values."""
+    fig, ax = plt.subplots(figsize=(7, 4))
+    bins = dist.get("bins", []) if isinstance(dist, dict) else []
+    counts = dist.get("counts", []) if isinstance(dist, dict) else []
+
+    if len(bins) < 2 or not counts:
+        ax.text(0.5, 0.5, "No lead-time data", ha="center", va="center", fontsize=10)
+        ax.set_axis_off()
+    else:
+        edges = np.asarray(bins, dtype=float)
+        counts_arr = np.asarray(counts, dtype=float)
+        n = min(len(edges) - 1, len(counts_arr))
+        edges = edges[: n + 1]
+        counts_arr = counts_arr[:n]
+        widths = edges[1:] - edges[:-1]
+        ax.bar(
+            edges[:-1],
+            counts_arr,
+            width=widths,
+            align="edge",
+            color="#90CAF9",
+            edgecolor="#1E88E5",
+            alpha=0.8,
+        )
+        bin_label = "Count of detected events by lead-time bucket (minutes)"
+        ax.legend(handles=[Patch(facecolor="#90CAF9", edgecolor="#1E88E5", label=bin_label)], loc="best")
+        ax.set_xlabel("Lead time (min)")
+        ax.set_ylabel("Count")
+        ax.set_xlim(edges[0], edges[-1])
+        ax.set_ylim(0, max(counts_arr) * 1.1 if counts_arr.size else 1.0)
+        tick_start = int(np.floor(edges[0]))
+        tick_end = int(np.ceil(edges[-1]))
+        ax.set_xticks(np.arange(tick_start, tick_end + 1, 10))
+
+    ax.set_title(title or "Lead Time Distribution")
+    fig.tight_layout()
+    if save_fig:
+        fig.savefig(save_fig, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_pr_vs_lead_time(
+        pr: dict,
+        save_fig: Optional[str],
+        title: Optional[str] = None,
+):
+    """Plot precision/recall as a function of lead time."""
+    fig, ax = plt.subplots(figsize=(7, 4))
+    lead_times = pr.get("lead_times", []) if isinstance(pr, dict) else []
+    precision = pr.get("precision", []) if isinstance(pr, dict) else []
+    recall = pr.get("recall", []) if isinstance(pr, dict) else []
+
+    if not lead_times:
+        ax.text(0.5, 0.5, "No PR-lead-time data", ha="center", va="center", fontsize=10)
+        ax.set_axis_off()
+    else:
+        n = min(len(lead_times), len(precision), len(recall))
+        x = np.asarray(lead_times[:n], dtype=float)
+        p = np.asarray(precision[:n], dtype=float)
+        r = np.asarray(recall[:n], dtype=float)
+        ax.plot(x, p, marker="o", color="#1E88E5", label="Precision")
+        ax.plot(x, r, marker="o", color="#43A047", label="Recall")
+        ax.set_xlabel("Lead time (min)")
+        ax.set_ylabel("Score")
+        ax.set_ylim(0.0, 1.0)
+        tick_start = int(np.floor(x.min()))
+        tick_end = int(np.ceil(x.max()))
+        ax.set_xticks(np.arange(tick_start, tick_end + 1, 10))
+        ax.set_yticks(np.arange(0.0, 1.01, 0.1))
+        ax.grid(True, axis="y", alpha=0.2)
+        ax.legend(loc="best")
+
+    ax.set_title(title or "Precision-Recall vs Lead Time")
+    fig.tight_layout()
+    if save_fig:
+        fig.savefig(save_fig, dpi=160, bbox_inches="tight")
+    plt.close(fig)

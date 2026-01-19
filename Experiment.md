@@ -92,7 +92,7 @@ Za servis zacetek `start` in konec `end` velja okno:
 
 ---
 
-# Rezim A: Single model (`EXPERIMENT_MODE="single"`) – `pipeline_runner.py`
+# Rezim A: Single model (`EXPERIMENT_MODE="single"`) – `main.py`
 
 ## Ucenje
 - model se uci na prvih `TRAIN_FRAC` minutah (trenutno 1440 min)
@@ -108,7 +108,7 @@ Za servis zacetek `start` in konec `end` velja okno:
 
 ---
 
-# Rezim B: Per-maintenance (`EXPERIMENT_MODE="per_maint"`) – `pipeline_runner.py`
+# Rezim B: Per-maintenance (`EXPERIMENT_MODE="per_maint"`) – `main.py`
 
 ## Globalni baseline
 - baseline = zacetni `TRAIN_FRAC` interval (brez phase=2)
@@ -191,6 +191,10 @@ Rezultat v obeh rezimih:
 
 ### Per-maintenance
 ![Per-maint risk timeline](plots/per_maint_metropt3_raw.png)
+![Per-maint lead time distribution](plots/per_maint_lead_time_distribution.png)
+![Per-maint precision/recall vs lead time](plots/per_maint_pr_vs_lead_time.png)
 
 ### Single
 ![Single risk timeline](plots/single_metropt3_raw.png)
+![Single lead time distribution](plots/single_lead_time_distribution.png)
+![Single precision/recall vs lead time](plots/single_pr_vs_lead_time.png)

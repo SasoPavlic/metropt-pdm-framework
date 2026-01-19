@@ -387,67 +387,6 @@ def evaluate_maintenance_prediction(
     event_scores = calculate_event_level_scores(predictions, maintenance_windows, early_warning_minutes)
     results["event_scores"] = event_scores
 
-    print(f"\n{'=' * 60}")
-    print(f"EVALUATION: {method_name}")
-    print(f"{'=' * 60}")
-
-    if ttd["mean_ttd"] is not None:
-        print(
-            f"[TTD] mean={ttd['mean_ttd']:.1f} min, std={ttd['std_ttd']:.1f}, "
-            f"min={ttd['min_ttd']:.1f}, max={ttd['max_ttd']:.1f}"
-        )
-    else:
-        print("[TTD] mean=N/A (no detections)")
-    print(f"[TTD] detected={ttd['detected_events']} missed={ttd['missed_events']}")
-
-    if faa["first_alarm_accuracy"] is not None:
-        print(
-            f"[FAA] accuracy={faa['first_alarm_accuracy']:.3f} "
-            f"({faa['first_alarm_in_window']}/{faa['tp_events']})"
-        )
-    else:
-        print("[FAA] accuracy=N/A")
-
-    if far["far_per_day"] is not None:
-        print(
-            f"[FAR] per_day={far['far_per_day']:.3f}, per_week={far['far_per_week']:.3f}, "
-            f"fp_intervals={far['fp_intervals']}"
-        )
-    else:
-        print("[FAR] per_day=N/A per_week=N/A")
-
-    print(
-        f"[COV] coverage={coverage['alarm_coverage_percent']:.2f}% "
-        f"({coverage['alarm_points']}/{coverage['total_points']})"
-    )
-
-    if mtia["mtia_minutes"] is not None:
-        print(
-            f"[MTIA] mean={mtia['mtia_minutes']:.1f} min, std={mtia['std_minutes']:.1f}, "
-            f"intervals={mtia['num_intervals']}"
-        )
-    else:
-        print("[MTIA] mean=N/A (no alarm intervals)")
-
-    print("[PR-LT]")
-    for i, lt in enumerate(pr_leadtime["lead_times"]):
-        print(
-            f"  {lt} min: P={pr_leadtime['precision'][i]:.3f}, "
-            f"R={pr_leadtime['recall'][i]:.3f}, F1={pr_leadtime['f1'][i]:.3f}"
-        )
-
-    print(
-        "[EVENT] TP={tp} FP={fp} FN={fn} P={p:.3f} R={r:.3f} F1={f:.3f}".format(
-            tp=event_scores["tp"],
-            fp=event_scores["fp"],
-            fn=event_scores["fn"],
-            p=event_scores["precision"],
-            r=event_scores["recall"],
-            f=event_scores["f1"],
-        )
-    )
-    print(f"{'=' * 60}\n")
-
     return results
 
 

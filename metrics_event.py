@@ -234,6 +234,83 @@ def calculate_mtia(predictions: pd.Series) -> Dict:
     }
 
 
+def calculate_nab_score(
+    predictions: pd.Series,
+    maintenance_windows: List[Tuple],
+    early_warning_minutes: int,
+    profile: str = "standard",
+) -> Dict:
+    """
+    Calculate NAB score using a strict pre-maintenance window:
+    [maintenance_start - early_warning, maintenance_start].
+    """
+    profiles = {
+        "standard": {"A_tp": 1.0, "A_fp": 0.11, "A_fn": 1.0},
+        "low_fp": {"A_tp": 1.0, "A_fp": 0.22, "A_fn": 1.0},
+        "low_fn": {"A_tp": 1.0, "A_fp": 0.11, "A_fn": 2.0},
+    }
+    if profile not in profiles:
+        raise ValueError(f"Unknown NAB profile: {profile!r}")
+    params = profiles[profile]
+
+    def sigmoid(x: float) -> float:
+        return 1.0 / (1.0 + np.exp(-x))
+
+    windows = _normalize_windows(maintenance_windows)
+    alarm_intervals = _alarm_intervals_from_mask(predictions.astype(bool))
+
+    total_score = 0.0
+    window_scores: List[float] = []
+    used_alarms: set[int] = set()
+
+    for maint_start, maint_end in windows:
+        warning_start = maint_start - pd.Timedelta(minutes=early_warning_minutes)
+        window_size = float(early_warning_minutes)
+
+        best_score = -params["A_fn"]
+        best_alarm_idx: Optional[int] = None
+
+        for idx, (alarm_start, alarm_end) in enumerate(alarm_intervals):
+            if idx in used_alarms:
+                continue
+            # Strict window overlap: [warning_start, maint_start]
+            if alarm_start <= maint_start and alarm_end >= warning_start:
+                detection_time = max(alarm_start, warning_start)
+                relative_pos = (
+                    (detection_time - warning_start).total_seconds() / 60.0 / window_size
+                )
+                score = params["A_tp"] * sigmoid(-5.0 * (relative_pos - 0.5))
+                if score > best_score:
+                    best_score = score
+                    best_alarm_idx = idx
+
+        if best_alarm_idx is not None:
+            used_alarms.add(best_alarm_idx)
+
+        total_score += best_score
+        window_scores.append(best_score)
+
+    # Penalize unused alarm intervals as FP
+    for idx in range(len(alarm_intervals)):
+        if idx not in used_alarms:
+            total_score -= params["A_fp"]
+
+    max_possible = len(windows) * params["A_tp"]
+    min_possible = -len(windows) * params["A_fn"] - len(alarm_intervals) * params["A_fp"]
+    if max_possible != min_possible:
+        normalized_score = 100.0 * (total_score - min_possible) / (max_possible - min_possible)
+    else:
+        normalized_score = 0.0
+
+    return {
+        "nab_score_raw": float(total_score),
+        "nab_score_normalized": float(normalized_score),
+        "profile": profile,
+        "window_scores": window_scores,
+        "num_fp": len(alarm_intervals) - len(used_alarms),
+    }
+
+
 def calculate_precision_recall_vs_leadtime(
     predictions: pd.Series,
     maintenance_windows: List[Tuple],
@@ -379,6 +456,21 @@ def evaluate_maintenance_prediction(
     mtia = calculate_mtia(predictions)
     results["mtia"] = mtia
 
+    nab_standard = calculate_nab_score(
+        predictions, maintenance_windows, early_warning_minutes, "standard"
+    )
+    nab_low_fp = calculate_nab_score(
+        predictions, maintenance_windows, early_warning_minutes, "low_fp"
+    )
+    nab_low_fn = calculate_nab_score(
+        predictions, maintenance_windows, early_warning_minutes, "low_fn"
+    )
+    results["nab"] = {
+        "standard": nab_standard,
+        "low_fp": nab_low_fp,
+        "low_fn": nab_low_fn,
+    }
+
     pr_leadtime = calculate_precision_recall_vs_leadtime(
         predictions, maintenance_windows, lead_times, early_warning_minutes
     )
@@ -410,6 +502,9 @@ def generate_results_table(results_list: List[Dict]) -> pd.DataFrame:
             else "N/A",
             "MTIA (min)": f"{r['mtia']['mtia_minutes']:.1f}"
             if r.get("mtia", {}).get("mtia_minutes") is not None
+            else "N/A",
+            "NAB Score": f"{r['nab']['standard']['nab_score_normalized']:.1f}"
+            if r.get("nab", {}).get("standard")
             else "N/A",
             "FAA": f"{r['first_alarm_accuracy']['first_alarm_accuracy']:.2f}"
             if r.get("first_alarm_accuracy", {}).get("first_alarm_accuracy") is not None

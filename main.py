@@ -100,7 +100,7 @@ RISK_EXCEEDANCE_QUANTILE: float = 0.95
 # Risk evaluation grid specification (start:stop:step).
 RISK_EVAL_GRID_SPEC: str = "0.30:0.90:0.10"
 # Lead-time step size for event-level curves (minutes).
-LEAD_STEP_MINUTES: int = 10
+LEAD_STEP_MINUTES: int = 30
 # Length of the post-maintenance training interval (in minutes) for the
 # per-maintenance regime. For each maintenance window W_j, the next model
 # (if any) is trained on the interval [end_j, end_j + POST_MAINT_TRAIN_MINUTES),
@@ -407,6 +407,7 @@ def _print_event_extra_metrics(label: str, event_results: dict) -> None:
     cov = event_results.get("coverage", {})
     mtia = event_results.get("mtia", {})
     pr = event_results.get("pr_leadtime", {})
+    nab = event_results.get("nab", {})
 
     if ttd.get("mean_ttd") is not None:
         print(
@@ -452,7 +453,19 @@ def _print_event_extra_metrics(label: str, event_results: dict) -> None:
             print(
                 f"  {lt} min: P={pr['precision'][i]:.3f}, "
                 f"R={pr['recall'][i]:.3f}, F1={pr['f1'][i]:.3f}"
-            ) 
+            )
+
+    if nab:
+        std = nab.get("standard", {}).get("nab_score_normalized")
+        low_fp = nab.get("low_fp", {}).get("nab_score_normalized")
+        low_fn = nab.get("low_fn", {}).get("nab_score_normalized")
+        if std is not None or low_fp is not None or low_fn is not None:
+            print(
+                "NAB: "
+                f"standard={std:.1f} "
+                f"low_fp={low_fp:.1f} "
+                f"low_fn={low_fn:.1f}"
+            )
 
 
 def _save_event_plots(event_results: dict, mode: str) -> None:

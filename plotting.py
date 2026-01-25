@@ -234,9 +234,10 @@ def plot_lead_time_distribution(
         ax.set_ylabel("Count")
         ax.set_xlim(edges[0], edges[-1])
         ax.set_ylim(0, max(counts_arr) * 1.1 if counts_arr.size else 1.0)
-        tick_start = int(np.floor(edges[0]))
-        tick_end = int(np.ceil(edges[-1]))
-        ax.set_xticks(np.arange(tick_start, tick_end + 1, 10))
+        centers = edges[:-1] + (widths / 2.0)
+        labels = [f"{int(round(edges[i]))}-{int(round(edges[i + 1]))}" for i in range(n)]
+        ax.set_xticks(centers)
+        ax.set_xticklabels(labels, rotation=45, ha="right")
 
     ax.set_title(title or "Lead Time Distribution")
     fig.tight_layout()

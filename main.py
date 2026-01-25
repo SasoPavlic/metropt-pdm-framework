@@ -86,7 +86,7 @@ SAVE_FEATURES_CSV_PATH: Optional[str] = "datasets/metropt3_features.csv"
 # - "single": one global model trained once on an early slice.
 # - "per_maint": per-maintenance models trained on fixed post-maintenance
 #   training days for each cycle (plus an initial pre-W1 model).
-EXPERIMENT_MODE: str = "per_maint"
+EXPERIMENT_MODE: str = "single"
 
 # Rolling window for feature aggregation (e.g., '600s' = 10 minutes).
 ROLLING_WINDOW: str = "60s"
@@ -412,43 +412,51 @@ def _print_event_extra_metrics(label: str, event_results: dict) -> None:
     if ttd.get("mean_ttd") is not None:
         print(
             f"TTD mean={ttd['mean_ttd']:.1f} min (std={ttd['std_ttd']:.1f}, "
-            f"min={ttd['min_ttd']:.1f}, max={ttd['max_ttd']:.1f})"
+            f"min={ttd['min_ttd']:.1f}, max={ttd['max_ttd']:.1f})  |  "
+            f"higher is better (earlier), max={PRE_MAINTENANCE_MINUTES} min"
         )
     else:
-        print("TTD mean=N/A (no detections)")
-    print(f"TTD detected={ttd.get('detected_events', 0)} missed={ttd.get('missed_events', 0)}")
+        print("TTD mean=N/A (no detections)  |  higher is better (earlier)")
+    print(
+        f"TTD detected={ttd.get('detected_events', 0)} "
+        f"missed={ttd.get('missed_events', 0)}  |  higher detected is better"
+    )
 
     if faa.get("first_alarm_accuracy") is not None:
         print(
             f"FAA={faa['first_alarm_accuracy']:.3f} "
-            f"({faa['first_alarm_in_window']}/{faa['tp_events']})"
+            f"({faa['first_alarm_in_window']}/{faa['tp_events']})  |  "
+            f"higher is better (ideal=1.0)"
         )
     else:
-        print("FAA=N/A")
+        print("FAA=N/A  |  higher is better (ideal=1.0)")
 
     if cov:
         print(
             f"Coverage={cov['alarm_coverage_percent']:.2f}% "
-            f"({cov['alarm_points']}/{cov['total_points']})"
+            f"({cov['alarm_points']}/{cov['total_points']})  |  "
+            f"lower is better (ideal≈0%)"
         )
 
     if mtia.get("mtia_minutes") is not None:
         print(
             f"MTIA mean={mtia['mtia_minutes']:.1f} min "
-            f"(std={mtia['std_minutes']:.1f}, intervals={mtia['num_intervals']})"
+            f"(std={mtia['std_minutes']:.1f}, intervals={mtia['num_intervals']})  |  "
+            f"lower is better"
         )
     else:
-        print("MTIA mean=N/A (no alarm intervals)")
+        print("MTIA mean=N/A (no alarm intervals)  |  lower is better")
 
     if far.get("far_per_week") is not None:
         print(
             f"FAR per_day={far['far_per_day']:.3f}  "
             f"per_week={far['far_per_week']:.3f}  "
-            f"FP intervals={far['fp_intervals']}"
+            f"FP intervals={far['fp_intervals']}  |  "
+            f"lower is better (ideal=0)"
         )
 
     if pr:
-        print("PR vs Lead Time:")
+        print("PR vs Lead Time (higher is better):")
         for i, lt in enumerate(pr.get("lead_times", [])):
             print(
                 f"  {lt} min: P={pr['precision'][i]:.3f}, "
@@ -464,7 +472,8 @@ def _print_event_extra_metrics(label: str, event_results: dict) -> None:
                 "NAB: "
                 f"standard={std:.1f} "
                 f"low_fp={low_fp:.1f} "
-                f"low_fn={low_fn:.1f}"
+                f"low_fn={low_fn:.1f}  |  "
+                f"higher is better (ideal=100)"
             )
 
 

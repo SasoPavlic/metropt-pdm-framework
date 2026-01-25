@@ -126,8 +126,8 @@ def calculate_first_alarm_accuracy(
 
     for maint_start, maint_end in windows:
         warning_start = maint_start - pd.Timedelta(minutes=early_warning_minutes)
-        extended_predictions = predictions.loc[warning_start:maint_end]
-        alarms_extended = extended_predictions[extended_predictions == 1]
+        window_predictions = predictions.loc[warning_start:maint_start]
+        alarms_extended = window_predictions[window_predictions == 1]
         if alarms_extended.empty:
             continue
         tp_events += 1
@@ -158,7 +158,8 @@ def calculate_far(
         is_tp = False
         for maint_start, maint_end in windows:
             warning_start = maint_start - pd.Timedelta(minutes=early_warning_minutes)
-            if alarm_start <= maint_end and alarm_end >= warning_start:
+            window_end = maint_start
+            if alarm_start <= window_end and alarm_end >= warning_start:
                 is_tp = True
                 break
         if not is_tp:
@@ -386,7 +387,7 @@ def calculate_event_level_scores(
     for maint_start, maint_end in windows:
         matched = False
         window_start = maint_start - horizon
-        window_end = maint_end
+        window_end = maint_start
         for i, (alarm_start, alarm_end) in enumerate(alarm_intervals):
             if alarm_used[i]:
                 continue

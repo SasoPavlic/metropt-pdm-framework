@@ -77,7 +77,7 @@ def _risk_scores(
     for fst, fend in failure_windows:
         matched = False
         window_start = fst - horizon
-        window_end = fend
+        window_end = fst
         for i, (ast, aend) in enumerate(alarm_intervals):
             if alarm_used[i]:
                 continue

@@ -86,7 +86,7 @@ SAVE_FEATURES_CSV_PATH: Optional[str] = "datasets/metropt3_features.csv"
 # - "single": one global model trained once on an early slice.
 # - "per_maint": per-maintenance models trained on fixed post-maintenance
 #   training days for each cycle (plus an initial pre-W1 model).
-EXPERIMENT_MODE: str = "single"
+EXPERIMENT_MODE: str = "per_maint"
 
 # Rolling window for feature aggregation (e.g., '600s' = 10 minutes).
 ROLLING_WINDOW: str = "60s"

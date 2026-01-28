@@ -45,7 +45,7 @@ Faze **niso vhod modela**, uporabljajo se samo za evaluacijo.
 ## A) Point-wise anomalije (po vrstici)
 Model vsaki vrstici dodeli `is_anomaly` (0/1):
 - `is_anomaly = 1`, ce je `anom_score >= threshold`
-- `threshold = Q3 + 3*IQR` iz **ucnih** score-ov (v `detector_model.py`)
+- `threshold = Q3 + 3*IQR` iz **ucnih** score-ov (v `detectors/postprocess.py`)
 
 ### Point-wise evaluacija
 V evaluacijo gredo samo faze 0 in 1:
@@ -83,7 +83,7 @@ Event-level logika je zgrajena na **risk signalu**, ki meri gostoto ekstremnih t
 
 ### Event-level TP/FP/FN
 Za servis zacetek `start` in konec `end` velja okno:
-`[start - PRE_MAINTENANCE_MINUTES, end]`
+`[start - PRE_MAINTENANCE_MINUTES, start]`
 
 - **TP**: alarm interval se s tem oknom **prekriva** (overlap)
 - **FN**: noben alarm se ne prekriva z oknom

@@ -1,7 +1,7 @@
 ## MetroPT PdM Framework
 
 General-purpose anomaly and early-warning pipeline for the MetroPT‑3 tram maintenance dataset.  
-The project ingests raw MetroPT telemetry, engineers rolling statistical features, trains an unsupervised detector (currently Isolation Forest), and evaluates alarms in the context of the 21 documented maintenance windows. The goal is to inspect how well an unsupervised model can warn about failures within the configured pre-maintenance horizon, while keeping the pipeline reusable for other detectors (e.g., autoencoders).
+The project ingests raw MetroPT telemetry, engineers rolling statistical features, trains an unsupervised detector, and evaluates alarms in the context of the 21 documented maintenance windows. The goal is to inspect how well an unsupervised model can warn about failures within the configured pre-maintenance horizon, while keeping the pipeline reusable for different detector backends (e.g., Isolation Forest now, autoencoders later).
 
 ### Dataset
 - `datasets/MetroPT3.csv`: 16 sensor channels (pressures, temperatures, currents, actuator states) with a timestamp column.
@@ -11,7 +11,7 @@ The project ingests raw MetroPT telemetry, engineers rolling statistical feature
 1. **Load & clean** – `data_utils.load_csv` removes “Unnamed” columns, infers the timestamp column, and sorts chronologically.
 2. **Feature selection** – `select_numeric_features` keeps all numeric sensors and orders them by domain preference when available.
 3. **Rolling aggregation** – `build_rolling_features` computes mean/median/std/skew/min/max over a configurable window (`ROLLING_WINDOW`, default `60s`) to produce the model matrix.
-4. **Detector training** – supports two regimes: a single global model (`EXPERIMENT_MODE="single"`) trained on the first `TRAIN_FRAC` minutes, or a sequence of per‑maintenance models (`"per_maint"`) trained on the initial baseline plus a short post‑maintenance interval for each cycle. The current implementation uses Isolation Forest (`detector_model.py`), but the pipeline structure is detector‑agnostic.
+4. **Detector training** – supports two regimes: a single global model (`EXPERIMENT_MODE="single"`) trained on the first `TRAIN_FRAC` minutes, or a sequence of per‑maintenance models (`"per_maint"`) trained on the initial baseline plus a short post‑maintenance interval for each cycle. The current implementation uses Isolation Forest via `detectors/iforest_detector.py`, but the pipeline is detector‑agnostic (`DETECTOR_TYPE`).
 5. **Maintenance context** – `build_operation_phase` encodes states (0 normal, 1 pre‑maintenance, 2 maintenance). `maintenance_risk` is the rolling average of extreme‑point exceedance (`risk_score >= RISK_EXCEEDANCE_QUANTILE`) over `RISK_WINDOW_MINUTES` minutes and serves as the early‑warning signal.
 6. **Risk threshold search** – `metrics_point.evaluate_risk_thresholds` tries a grid (`RISK_EVAL_GRID_SPEC`) and reports precision/recall/F1 along with TP/FP/FN counts for alarms versus maintenance windows.
 7. **Outputs** – `datasets/metropt3_features.csv` (opt.) with the engineered rolling stats, `datasets/metropt3_predictions.csv` (opt.) with scores/risk/phase, `<mode>_metropt3_raw.png` showing the risk timeline with failures, `<mode>_lead_time_distribution.png` for the lead-time histogram, `<mode>_pr_vs_lead_time.png` for precision/recall vs lead time, plus console `[INFO]` model settings and `[RISK]` summaries.
@@ -23,6 +23,10 @@ numpy
 pandas
 scikit-learn
 matplotlib
+```
+Optional (only when using `DETECTOR_TYPE="autoencoder"`):
+```
+torch
 ```
 
 ### Usage
@@ -46,7 +50,7 @@ Command-line arguments are not required, but you can tweak configuration constan
 ### Key Files
 - `main.py` – main workflow runner (loading → features → model → risk → plotting).
 - `data_utils.py` – CSV ingestion, feature engineering, maintenance-window parsing.
-- `detector_model.py` – detector wrapper (Isolation Forest today, extensible for autoencoders).
+- `detectors/` – detector backends and shared post‑processing (`iforest_detector.py`, `autoencoder_detector.py`, `postprocess.py`).
 - `metrics_point.py` – point‑wise and risk‑grid evaluation.
 - `metrics_event.py` – event‑level evaluation (TTD, FAR, FAA, MTIA, PR‑LT, etc.).
 - `plotting.py` – visualisation of risk states, lead-time distribution, and precision/recall vs lead time.

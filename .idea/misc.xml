@@ -3,5 +3,5 @@
   <component name="Black">
     <option name="sdkName" value="Python 3.10 shared" />
   </component>
-  <component name="ProjectRootManager" version="2" project-jdk-name="Python 3.10 shared" project-jdk-type="Python SDK" />
+  <component name="ProjectRootManager" version="2" project-jdk-name="Poetry (NiaNetCAE)" project-jdk-type="Python SDK" />
 </project>

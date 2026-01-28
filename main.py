@@ -28,7 +28,9 @@ from data_utils import (
 )
 from metrics_event import evaluate_maintenance_prediction
 from metrics_point import confusion_and_scores, evaluate_risk_thresholds
-from detector_model import train_iforest_on_slices, _time_based_train_mask
+from detectors import get_detector
+from detectors.postprocess import train_and_score
+from detectors.utils import time_based_train_mask
 from plotting import plot_raw_timeline, plot_lead_time_distribution, plot_pr_vs_lead_time
 
 
@@ -87,6 +89,77 @@ SAVE_FEATURES_CSV_PATH: Optional[str] = "datasets/metropt3_features.csv"
 # - "per_maint": per-maintenance models trained on fixed post-maintenance
 #   training days for each cycle (plus an initial pre-W1 model).
 EXPERIMENT_MODE: str = "per_maint"
+
+# Detector backend ("iforest" now, "autoencoder" later)
+DETECTOR_TYPE: str = "autoencoder"
+
+# Autoencoder / VAE settings (used when DETECTOR_TYPE="autoencoder")
+AE_SEQUENCE_LEN: int = 200
+AE_STRIDE: int = 1
+AE_RNN_TYPE: str = "LSTM"
+AE_HIDDEN_SIZE: int = 32
+AE_NUM_LAYERS: int = 3
+AE_BIDIRECTIONAL: bool = False
+AE_LATENT_DIM: Optional[int] = None  # defaults to features // 2
+AE_BETA: float = 0.1
+AE_EPOCHS: int = 20
+AE_BATCH_SIZE: int = 256
+AE_NUM_WORKERS: int = 4
+AE_PIN_MEMORY: bool = True
+AE_PERSISTENT_WORKERS: bool = True
+AE_LR: float = 1e-3
+AE_WEIGHT_DECAY: float = 0.0
+AE_DEVICE: str = "cuda"
+AE_MODEL_PATH: Optional[str] = None  # set to load a pretrained AE/VAE
+AE_LOAD_PRETRAINED: bool = True
+
+# Detector hyperparameters
+DETECTOR_KWARGS = {"random_state": 42}
+if DETECTOR_TYPE == "autoencoder":
+    from detectors.vae_models import build_recurrent_vae
+
+    def _vae_factory(
+        input_dim: int,
+        seq_len: int = AE_SEQUENCE_LEN,
+        rnn_type: str = AE_RNN_TYPE,
+        hidden_size: int = AE_HIDDEN_SIZE,
+        num_layers: int = AE_NUM_LAYERS,
+        latent_dim: int = 1,
+        bidirectional: bool = AE_BIDIRECTIONAL,
+    ):
+        return build_recurrent_vae(
+            input_dim=input_dim,
+            seq_len=seq_len,
+            rnn_type=rnn_type,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            latent_dim=latent_dim,
+            bidirectional=bidirectional,
+        )
+
+    DETECTOR_KWARGS = {
+        "model_factory": _vae_factory,
+        "epochs": AE_EPOCHS,
+        "batch_size": AE_BATCH_SIZE,
+        "lr": AE_LR,
+        "weight_decay": AE_WEIGHT_DECAY,
+        "device": AE_DEVICE,
+        "sequence_len": AE_SEQUENCE_LEN,
+        "stride": AE_STRIDE,
+        "beta": AE_BETA,
+        "rnn_type": AE_RNN_TYPE,
+        "hidden_size": AE_HIDDEN_SIZE,
+        "num_layers": AE_NUM_LAYERS,
+        "latent_dim": AE_LATENT_DIM,
+        "bidirectional": AE_BIDIRECTIONAL,
+        "model_path": AE_MODEL_PATH,
+        "load_pretrained": AE_LOAD_PRETRAINED,
+        "num_workers": AE_NUM_WORKERS,
+        "persistent_workers": AE_PERSISTENT_WORKERS,
+        "pin_memory": AE_PIN_MEMORY,
+    }
+
+
 
 # Rolling window for feature aggregation (e.g., '600s' = 10 minutes).
 ROLLING_WINDOW: str = "60s"
@@ -510,17 +583,13 @@ def _run_single_model_experiment(
 ) -> Tuple[pd.DataFrame, dict, Optional[pd.Timestamp], Optional[float], Optional[pd.Series]]:
     """Baseline: single global model trained once and scored over the full timeline."""
     # Time-based training window, restricted to non-maintenance rows (phases 0/1)
-    train_time_mask = _time_based_train_mask(X.index, TRAIN_FRAC)
+    train_time_mask = time_based_train_mask(X.index, TRAIN_FRAC)
     op_phase = operation_phase.reindex(X.index).astype(np.int8)
     train_mask = train_time_mask & (op_phase != 2)
     if train_mask.sum() < 2:
         raise ValueError("Single-model training set has fewer than 2 samples after filtering.")
-
-    pred_if, info = train_iforest_on_slices(
-        X_train=X.loc[train_mask],
-        X_all=X,
-        random_state=42,
-    )
+    detector = get_detector(DETECTOR_TYPE, **DETECTOR_KWARGS)
+    pred_if, info = train_and_score(detector, X.loc[train_mask], X)
 
     pred = pred_if.copy()
 
@@ -630,7 +699,7 @@ def _run_per_maintenance_experiment(
 
     # Initial training window (shared with the single-model regime) – this is
     # the global baseline that every per-maintenance model sees.
-    initial_train_time_mask = _time_based_train_mask(index, TRAIN_FRAC)
+    initial_train_time_mask = time_based_train_mask(index, TRAIN_FRAC)
     initial_train_order_mask = initial_train_time_mask.copy()
     # For regime 2 we only exclude maintenance rows from training.
     initial_train_mask = initial_train_time_mask & (op_phase != 2)
@@ -667,13 +736,8 @@ def _run_per_maintenance_experiment(
         X_test = X.loc[test_mask]
         if X_train.shape[0] < 2 or X_test.shape[0] < 2:
             return None
-
-
-        slice_pred, info = train_iforest_on_slices(
-            X_train=X_train,
-            X_all=X_test,
-            random_state=42,
-        )
+        detector = get_detector(DETECTOR_TYPE, **DETECTOR_KWARGS)
+        slice_pred, info = train_and_score(detector, X_train, X_test)
 
         pred.loc[test_mask, "anom_score"] = slice_pred["anom_score"]
         pred.loc[test_mask, "is_anomaly"] = slice_pred["is_anomaly"]

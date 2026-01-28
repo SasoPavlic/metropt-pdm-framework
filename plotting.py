@@ -27,6 +27,7 @@ def plot_raw_timeline(
         predicted_phase: Optional[pd.Series] = None,
         risk_threshold: Optional[float] = None,
         early_warning_minutes: float = 120.0,
+        detector_name: Optional[str] = None,
 ):
     fig, ax = plt.subplots(figsize=(14, 5.5))
 

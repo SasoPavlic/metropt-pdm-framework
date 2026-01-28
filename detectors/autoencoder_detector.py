@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import math
 from typing import Optional
 
 import numpy as np
@@ -29,6 +30,7 @@ class AEConfig:
     load_pretrained: bool = True
     sequence_len: int = 200
     stride: int = 1
+    score_stride: Optional[int] = None
     beta: float = 0.1
     rnn_type: str = "LSTM"
     hidden_size: int = 32
@@ -55,6 +57,7 @@ class AutoencoderDetector(BaseDetector):
         load_pretrained: bool = True,
         sequence_len: int = 200,
         stride: int = 1,
+        score_stride: Optional[int] = None,
         beta: float = 0.1,
         rnn_type: str = "LSTM",
         hidden_size: int = 32,
@@ -78,6 +81,7 @@ class AutoencoderDetector(BaseDetector):
             load_pretrained=load_pretrained,
             sequence_len=sequence_len,
             stride=stride,
+            score_stride=score_stride,
             beta=beta,
             rnn_type=rnn_type,
             hidden_size=hidden_size,
@@ -109,6 +113,10 @@ class AutoencoderDetector(BaseDetector):
         if not path.exists():
             raise FileNotFoundError(f"Model path not found: {path}")
         import torch
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
         obj = torch.load(path, map_location="cpu")
         return obj
 
@@ -165,6 +173,13 @@ class AutoencoderDetector(BaseDetector):
         )
         dm.setup()
 
+        train_windows = len(dm.train_dataset) if dm.train_dataset is not None else 0
+        train_batches = train_windows // self.cfg.batch_size if self.cfg.batch_size else 0
+        print(
+            f"[INFO] AE train windows={train_windows} (seq_len={self.cfg.sequence_len}, stride={self.cfg.stride}), "
+            f"batches={train_batches} (batch_size={self.cfg.batch_size})"
+        )
+
         accelerator = "gpu" if self.cfg.device == "cuda" and torch.cuda.is_available() else "cpu"
         trainer = Trainer(
             max_epochs=self.cfg.epochs,
@@ -192,8 +207,9 @@ class AutoencoderDetector(BaseDetector):
         if self.scaler is not None:
             X_vals = self.scaler.transform(X_vals)
 
+        score_stride = self.cfg.score_stride or self.cfg.stride
         dataset = MetroPTSequenceDataset(
-            data=X_vals, seq_len=self.cfg.sequence_len, stride=self.cfg.stride
+            data=X_vals, seq_len=self.cfg.sequence_len, stride=score_stride
         )
         loader = DataLoader(
             dataset,
@@ -205,15 +221,26 @@ class AutoencoderDetector(BaseDetector):
             drop_last=False,
         )
 
+        score_windows = len(dataset)
+        score_batches = len(loader)
+        print(
+            f"[INFO] AE score windows={score_windows} (seq_len={self.cfg.sequence_len}, stride={score_stride}), "
+            f"batches={score_batches} (batch_size={self.cfg.batch_size})"
+        )
+
         scores = np.full((X_vals.shape[0],), np.nan, dtype=np.float32)
         self.model.eval()
+        total_batches = len(loader)
+        log_every = max(1, total_batches // 10)
         with torch.no_grad():
-            for windows, anchors in loader:
+            for batch_idx, (windows, anchors) in enumerate(loader, start=1):
                 windows = windows.to(self.model.device)
                 recon, _, _ = self.model(windows)
                 err = (recon - windows) ** 2
                 window_scores = err.mean(dim=(1, 2)).detach().cpu().numpy()
                 scores[anchors.numpy()] = window_scores
+                if batch_idx % log_every == 0 or batch_idx == total_batches:
+                    print(f"[INFO] AE scoring: {batch_idx}/{total_batches} batches")
 
         # TODO: consider alternative aggregation (max/last) and alignment strategy.
         return pd.Series(scores, index=X.index, name="anom_score")

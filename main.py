@@ -13,6 +13,8 @@ Single-series anomaly explorer (native timeline plot, MetroPT-3).
 from __future__ import annotations
 
 import argparse
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -61,6 +63,33 @@ def _mode_output_path(path: Optional[str], mode: str) -> Optional[str]:
     return str(p / f"{mode}.png")
 
 
+
+
+def _log_pipeline_overview() -> None:
+    steps = [
+        "Load data",
+        "Build rolling features",
+        "Build maintenance context",
+        "Train/score detector (mode-specific)",
+        "Evaluate point-wise + event metrics",
+        "Plot + save outputs",
+    ]
+    print("\nPIPELINE OVERVIEW")
+    for i, step in enumerate(steps, start=1):
+        print(f"  {i}. {step}")
+
+
+def _log_step_start(name: str) -> float:
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[STEP] {name} ... start {ts}")
+    return time.perf_counter()
+
+
+def _log_step_end(name: str, t0: float) -> None:
+    dt = time.perf_counter() - t0
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[STEP] {name} ... done in {dt:.2f}s at {ts}")
+
 def _print_section(title: str) -> None:
     bar = "=" * 60
     print(f"\n{bar}")
@@ -88,7 +117,7 @@ SAVE_FEATURES_CSV_PATH: Optional[str] = "datasets/metropt3_features.csv"
 # - "single": one global model trained once on an early slice.
 # - "per_maint": per-maintenance models trained on fixed post-maintenance
 #   training days for each cycle (plus an initial pre-W1 model).
-EXPERIMENT_MODE: str = "per_maint"
+EXPERIMENT_MODE: str = "single"
 
 # Detector backend ("iforest" now, "autoencoder" later)
 DETECTOR_TYPE: str = "autoencoder"
@@ -96,19 +125,20 @@ DETECTOR_TYPE: str = "autoencoder"
 # Autoencoder / VAE settings (used when DETECTOR_TYPE="autoencoder")
 AE_SEQUENCE_LEN: int = 200
 AE_STRIDE: int = 1
+AE_SCORE_STRIDE: int = 1
 AE_RNN_TYPE: str = "LSTM"
-AE_HIDDEN_SIZE: int = 32
-AE_NUM_LAYERS: int = 3
+AE_HIDDEN_SIZE: int = 64
+AE_NUM_LAYERS: int = 9
 AE_BIDIRECTIONAL: bool = False
-AE_LATENT_DIM: Optional[int] = None  # defaults to features // 2
+AE_LATENT_DIM: Optional[int] = 10  # defaults to features // 2 (n_features = (# numeric sensors) × 6 = 96 features
 AE_BETA: float = 0.1
 AE_EPOCHS: int = 20
 AE_BATCH_SIZE: int = 256
-AE_NUM_WORKERS: int = 4
+AE_NUM_WORKERS: int = 16
 AE_PIN_MEMORY: bool = True
 AE_PERSISTENT_WORKERS: bool = True
 AE_LR: float = 1e-3
-AE_WEIGHT_DECAY: float = 0.0
+AE_WEIGHT_DECAY: float = 0.001
 AE_DEVICE: str = "cuda"
 AE_MODEL_PATH: Optional[str] = None  # set to load a pretrained AE/VAE
 AE_LOAD_PRETRAINED: bool = True
@@ -146,6 +176,7 @@ if DETECTOR_TYPE == "autoencoder":
         "device": AE_DEVICE,
         "sequence_len": AE_SEQUENCE_LEN,
         "stride": AE_STRIDE,
+        "score_stride": AE_SCORE_STRIDE,
         "beta": AE_BETA,
         "rnn_type": AE_RNN_TYPE,
         "hidden_size": AE_HIDDEN_SIZE,
@@ -715,6 +746,57 @@ def _run_per_maintenance_experiment(
 
     period_infos: List[dict] = []
 
+    def _is_trainable(train_mask: pd.Series, test_mask: pd.Series) -> bool:
+        train_mask = _ensure_bool_mask(train_mask, index)
+        test_mask = _ensure_bool_mask(test_mask, index)
+        if not test_mask.any():
+            return False
+        X_train = X.loc[train_mask]
+        X_test = X.loc[test_mask]
+        return X_train.shape[0] >= 2 and X_test.shape[0] >= 2
+
+    def _count_trainable_segments() -> int:
+        count = 0
+        current_mask = initial_train_mask
+        # pre_W1
+        if _is_trainable(current_mask, pre_w1_test_mask):
+            count += 1
+        # per maintenance cycle
+        for j, (start_ts, end_ts) in enumerate(zip(starts, ends)):
+            maint_mask = (index >= pd.to_datetime(start_ts)) & (index <= pd.to_datetime(end_ts))
+            if _is_trainable(current_mask, maint_mask):
+                count += 1
+            gap_start = pd.to_datetime(end_ts)
+            gap_end = pd.to_datetime(starts[j + 1]) if j < len(starts) - 1 else data_end
+            if gap_end <= gap_start:
+                continue
+            gap_minutes = (gap_end - gap_start).total_seconds() / 60.0
+            gap_mask = (index > gap_start) & (index < gap_end if j < len(starts) - 1 else index <= gap_end)
+            if not gap_mask.any():
+                continue
+            if POST_MAINT_TRAIN_MINUTES <= 0 or gap_minutes <= POST_MAINT_TRAIN_MINUTES:
+                if _is_trainable(current_mask, gap_mask):
+                    count += 1
+                continue
+            train_end = gap_start + pd.Timedelta(minutes=float(POST_MAINT_TRAIN_MINUTES))
+            if train_end > gap_end:
+                train_end = gap_end
+            local_post_mask = (
+                (index > gap_start)
+                & (index <= train_end)
+                & (index <= gap_end)
+                & (op_phase != 2)
+            )
+            train_mask_new = initial_train_mask | local_post_mask
+            test_mask_new = (index > train_end) & (index < gap_end if j < len(starts) - 1 else index <= gap_end)
+            if _is_trainable(train_mask_new, test_mask_new):
+                count += 1
+                current_mask = train_mask_new
+        return count
+
+    total_models = _count_trainable_segments()
+    model_idx = 0
+
     print(
         f"[INFO] Per-maint mode: {len(mw_sorted) + 1} logical cycles "
         f"(pre-W1 plus one cycle per maintenance window)"
@@ -736,8 +818,20 @@ def _run_per_maintenance_experiment(
         X_test = X.loc[test_mask]
         if X_train.shape[0] < 2 or X_test.shape[0] < 2:
             return None
+        nonlocal model_idx
+        model_idx += 1
+        print(
+            f"[INFO] Training model {model_idx}/{total_models}: {seg_label} (train_size={X_train.shape[0]}, test_size={X_test.shape[0]})"
+        )
         detector = get_detector(DETECTOR_TYPE, **DETECTOR_KWARGS)
+        t_seg = None
+        if DETECTOR_TYPE == "autoencoder":
+            t_seg = _log_step_start(
+                f"Train AE segment {seg_label} (train={X_train.shape[0]}, test={X_test.shape[0]})"
+            )
         slice_pred, info = train_and_score(detector, X_train, X_test)
+        if t_seg is not None:
+            _log_step_end(f"Train AE segment {seg_label}", t_seg)
 
         pred.loc[test_mask, "anom_score"] = slice_pred["anom_score"]
         pred.loc[test_mask, "is_anomaly"] = slice_pred["is_anomaly"]
@@ -891,7 +985,10 @@ def _run_per_maintenance_experiment(
 
 def main() -> None:
     # 1) Build rolling feature matrix and maintenance context
+    _log_pipeline_overview()
+    t_build = _log_step_start("Build features + context")
     X, maint_windows, operation_phase = _build_features_and_context()
+    _log_step_end("Build features + context", t_build)
 
     # 2) Run the selected experiment mode
     mode = EXPERIMENT_MODE.lower().strip()
@@ -901,6 +998,7 @@ def main() -> None:
             f"use 'single' or 'per_maint'."
         )
 
+    t_run = _log_step_start("Run experiment")
     if mode == "single":
         pred, info, train_cutoff_ts, best_risk_threshold, predicted_phase = _run_single_model_experiment(
             X, maint_windows, operation_phase
@@ -910,14 +1008,17 @@ def main() -> None:
             X, maint_windows, operation_phase
         )
         train_cutoff_ts = None
+    _log_step_end("Run experiment", t_run)
 
     # 3) Plot risk timeline
+    t_plot = _log_step_start("Plot + save outputs")
     df_plot = pred[["maintenance_risk"]].copy()
 
     effective_show_labels = bool(SHOW_WINDOW_LABELS or USE_DEFAULT_METROPT_WINDOWS)
     save_fig_path = _mode_output_path(SAVE_FIG_PATH, EXPERIMENT_MODE)
     if save_fig_path:
         Path(save_fig_path).parent.mkdir(parents=True, exist_ok=True)
+    detector_label = "VAE" if DETECTOR_TYPE == "autoencoder" else "IsolationForest"
     plot_raw_timeline(
         df_plot,
         maint_windows,
@@ -930,6 +1031,7 @@ def main() -> None:
         predicted_phase=predicted_phase,
         risk_threshold=best_risk_threshold,
         early_warning_minutes=PRE_MAINTENANCE_MINUTES,
+        detector_name=detector_label,
     )
 
     # 4) Optional: save per-point predictions (timestamp, score, labels, risk)
@@ -937,6 +1039,8 @@ def main() -> None:
         out = pred.copy()
         out.index.name = "timestamp"
         out.to_csv(SAVE_PRED_CSV_PATH)
+
+    _log_step_end("Plot + save outputs", t_plot)
 
     if maint_windows:
         rows = []

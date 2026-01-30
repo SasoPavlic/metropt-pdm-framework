@@ -78,12 +78,13 @@ def train_and_score(
 
     risk_score = build_risk_score(scores_train, scores_all)
     thr, thr_info = compute_threshold(scores_train)
-    is_anom = np.where(scores_all.values > thr, 1, 0)
+    is_anom = (scores_all > thr).astype(float)
+    is_anom[scores_all.isna()] = np.nan
 
     out = pd.DataFrame(index=X_all.index)
     out["anom_score"] = scores_all.values
     out["risk_score"] = risk_score.values
-    out["is_anomaly"] = is_anom
+    out["is_anomaly"] = is_anom.values
 
     info = {
         "n_total": int(X_all.shape[0]),

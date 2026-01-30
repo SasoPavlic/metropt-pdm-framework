@@ -34,6 +34,7 @@ from detectors import get_detector
 from detectors.postprocess import train_and_score
 from detectors.utils import time_based_train_mask
 from plotting import plot_raw_timeline, plot_lead_time_distribution, plot_pr_vs_lead_time
+from logging_utils import log_to_file
 
 
 def parse_risk_grid_spec(spec: str) -> List[float]:
@@ -51,6 +52,30 @@ def parse_risk_grid_spec(spec: str) -> List[float]:
         values.append(round(val, 6))
         val += step
     return values
+
+
+
+
+
+
+def _output_path_with_detector(path: Optional[str], mode: str, detector: str) -> Optional[str]:
+    if not path:
+        return None
+    p = Path(path)
+    stem = p.stem
+    suffix = p.suffix or ".png"
+    name = f"{stem}_{detector}_{mode}{suffix}"
+    return str(p.with_name(name))
+
+
+def _pred_output_path(path: Optional[str], mode: str, detector: str) -> Optional[str]:
+    if not path:
+        return None
+    p = Path(path)
+    stem = p.stem
+    suffix = p.suffix or ".csv"
+    name = f"{stem}_{detector}_{mode}{suffix}"
+    return str(p.with_name(name))
 
 
 def _mode_output_path(path: Optional[str], mode: str) -> Optional[str]:
@@ -117,7 +142,7 @@ SAVE_FEATURES_CSV_PATH: Optional[str] = "datasets/metropt3_features.csv"
 # - "single": one global model trained once on an early slice.
 # - "per_maint": per-maintenance models trained on fixed post-maintenance
 #   training days for each cycle (plus an initial pre-W1 model).
-EXPERIMENT_MODE: str = "single"
+EXPERIMENT_MODE: str = "per_maint"
 
 # Detector backend ("iforest" now, "autoencoder" later)
 DETECTOR_TYPE: str = "autoencoder"
@@ -127,14 +152,14 @@ AE_SEQUENCE_LEN: int = 200
 AE_STRIDE: int = 1
 AE_SCORE_STRIDE: int = 1
 AE_RNN_TYPE: str = "LSTM"
-AE_HIDDEN_SIZE: int = 64
-AE_NUM_LAYERS: int = 9
+AE_HIDDEN_SIZE: int = 8
+AE_NUM_LAYERS: int = 2
 AE_BIDIRECTIONAL: bool = False
-AE_LATENT_DIM: Optional[int] = 10  # defaults to features // 2 (n_features = (# numeric sensors) × 6 = 96 features
-AE_BETA: float = 0.1
+AE_LATENT_DIM: Optional[int] = 48  # defaults to features // 2 (n_features = (# numeric sensors) × 6 = 96 features
+AE_BETA: float = 0.01
 AE_EPOCHS: int = 20
 AE_BATCH_SIZE: int = 256
-AE_NUM_WORKERS: int = 16
+AE_NUM_WORKERS: int = 8
 AE_PIN_MEMORY: bool = True
 AE_PERSISTENT_WORKERS: bool = True
 AE_LR: float = 1e-3
@@ -200,7 +225,7 @@ TRAIN_FRAC: float = 1440
 # Rolling risk window (minutes).
 RISK_WINDOW_MINUTES: int = 480
 # Quantile for extreme-point exceedance when building maintenance risk.
-RISK_EXCEEDANCE_QUANTILE: float = 0.95
+RISK_EXCEEDANCE_QUANTILE: float = 0.90
 # Risk evaluation grid specification (start:stop:step).
 RISK_EVAL_GRID_SPEC: str = "0.30:0.90:0.10"
 # Lead-time step size for event-level curves (minutes).
@@ -581,21 +606,21 @@ def _print_event_extra_metrics(label: str, event_results: dict) -> None:
             )
 
 
-def _save_event_plots(event_results: dict, mode: str) -> None:
+def _save_event_plots(event_results: dict, mode: str, detector: str) -> None:
     if not event_results:
         return
     dist = event_results.get("lead_time_distribution", {})
     pr = event_results.get("pr_leadtime", {})
 
-    dist_path = _mode_output_path(SAVE_LEAD_TIME_DIST_PATH, mode)
-    pr_path = _mode_output_path(SAVE_PR_LEADTIME_PATH, mode)
+    dist_path = _output_path_with_detector(SAVE_LEAD_TIME_DIST_PATH, mode, detector)
+    pr_path = _output_path_with_detector(SAVE_PR_LEADTIME_PATH, mode, detector)
 
     if dist_path:
         Path(dist_path).parent.mkdir(parents=True, exist_ok=True)
         plot_lead_time_distribution(
             dist,
             save_fig=dist_path,
-            title=f"Lead Time Distribution ({mode})",
+            title=f"Lead Time Distribution ({detector}, {mode})",
         )
 
     if pr_path:
@@ -603,7 +628,7 @@ def _save_event_plots(event_results: dict, mode: str) -> None:
         plot_pr_vs_lead_time(
             pr,
             save_fig=pr_path,
-            title=f"Precision-Recall vs Lead Time ({mode})",
+            title=f"Precision-Recall vs Lead Time ({detector}, {mode})",
         )
 
 
@@ -677,7 +702,7 @@ def _run_single_model_experiment(
     )
     info["event_metrics"] = event_results
     _print_event_extra_metrics("Single", event_results)
-    _save_event_plots(event_results, mode="single")
+    _save_event_plots(event_results, mode="single", detector=DETECTOR_TYPE)
 
     # Console summary
     total_pts = int(pred["is_anomaly"].sum())
@@ -745,6 +770,12 @@ def _run_per_maintenance_experiment(
     risk_segments: List[pd.Series] = []
 
     period_infos: List[dict] = []
+
+    data_start = index.min()
+    data_end = index.max()
+    first_start = starts[0]
+    pre_w1_test_mask = (index < first_start) & (~initial_train_order_mask)
+    current_train_mask = initial_train_mask
 
     def _is_trainable(train_mask: pd.Series, test_mask: pd.Series) -> bool:
         train_mask = _ensure_bool_mask(train_mask, index)
@@ -853,10 +884,6 @@ def _run_per_maintenance_experiment(
         }
 
     # Model 0: pre-W1 region, trained on the initial TRAIN_FRAC slice only.
-    first_start = starts[0]
-    pre_w1_test_mask = (index < first_start) & (~initial_train_order_mask)
-    current_train_mask = initial_train_mask
-
     seg_info = _fit_and_score_segment("pre_W1", current_train_mask, pre_w1_test_mask)
     if seg_info:
         period_infos.append(seg_info)
@@ -864,9 +891,6 @@ def _run_per_maintenance_experiment(
     # Iterate over maintenance windows; after each, either train a new model on
     # its post-maintenance training interval (plus the global baseline) or
     # reuse the previous model for short gaps.
-    data_start = index.min()
-    data_end = index.max()
-
     for j, (start_ts, end_ts) in enumerate(zip(starts, ends)):
         # Score the maintenance window itself with the current model (risk only).
         maint_mask = (index >= pd.to_datetime(start_ts)) & (index <= pd.to_datetime(end_ts))
@@ -964,7 +988,7 @@ def _run_per_maintenance_experiment(
         lead_step_minutes=LEAD_STEP_MINUTES,
     )
     _print_event_extra_metrics("Per-maint", event_results)
-    _save_event_plots(event_results, mode="per_maint")
+    _save_event_plots(event_results, mode="per_maint", detector=DETECTOR_TYPE)
 
     if period_infos:
         n_used = len(period_infos)
@@ -1015,7 +1039,7 @@ def main() -> None:
     df_plot = pred[["maintenance_risk"]].copy()
 
     effective_show_labels = bool(SHOW_WINDOW_LABELS or USE_DEFAULT_METROPT_WINDOWS)
-    save_fig_path = _mode_output_path(SAVE_FIG_PATH, EXPERIMENT_MODE)
+    save_fig_path = _output_path_with_detector(SAVE_FIG_PATH, EXPERIMENT_MODE, DETECTOR_TYPE)
     if save_fig_path:
         Path(save_fig_path).parent.mkdir(parents=True, exist_ok=True)
     detector_label = "VAE" if DETECTOR_TYPE == "autoencoder" else "IsolationForest"
@@ -1037,8 +1061,14 @@ def main() -> None:
     # 4) Optional: save per-point predictions (timestamp, score, labels, risk)
     if SAVE_PRED_CSV_PATH:
         out = pred.copy()
+        if "anom_score" in out.columns:
+            no_score = out["anom_score"].isna()
+            null_cols = [c for c in ["risk_score", "exceedance", "maintenance_risk", "predicted_phase", "is_anomaly"] if c in out.columns]
+            if null_cols:
+                out.loc[no_score, null_cols] = np.nan
         out.index.name = "timestamp"
-        out.to_csv(SAVE_PRED_CSV_PATH)
+        pred_path = _pred_output_path(SAVE_PRED_CSV_PATH, EXPERIMENT_MODE, DETECTOR_TYPE)
+        out.to_csv(pred_path)
 
     _log_step_end("Plot + save outputs", t_plot)
 
@@ -1076,4 +1106,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    with log_to_file(DETECTOR_TYPE, EXPERIMENT_MODE):
+        main()

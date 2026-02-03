@@ -125,7 +125,7 @@ class AutoencoderDetector(BaseDetector):
         import torch
         from lightning import Trainer
 
-        from dataloaders.metropt_datamodule import MetroPTDataModule
+        from dataloaders.metropt_dataloader import MetroPTDataModule
         from detectors.lightning_vae_module import RecurrentVAELightningModule
 
         if X_train is None or X_train.shape[0] < 2:
@@ -198,7 +198,7 @@ class AutoencoderDetector(BaseDetector):
         import torch
         from torch.utils.data import DataLoader
 
-        from dataloaders.sequence_dataset import MetroPTSequenceDataset
+        from dataloaders.metropt_dataloader import MetroPTSequenceDataset
 
         if self.model is None:
             raise ValueError("Detector must be fitted or loaded before scoring.")

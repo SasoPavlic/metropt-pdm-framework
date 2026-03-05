@@ -28,6 +28,10 @@ Optional (only when using `DETECTOR_TYPE="autoencoder"`):
 ```
 torch
 ```
+Optional (only when using imported NiaNetVAE pretrained models):
+```
+pip install -e ../NiaNetVAE
+```
 
 ### Usage
 1. Place `MetroPT3.csv` in `datasets/` (or update `INPUT_PATH` in `main.py`).
@@ -46,6 +50,40 @@ torch
 By default `EXPERIMENT_MODE` in `main.py` is set to `"single"` (one global model). Set it to `"per_maint"` to enable per‑maintenance models, where each cycle is trained on the initial baseline plus a post‑maintenance training interval.
 
 Command-line arguments are not required, but you can tweak configuration constants at the top of `main.py` (paths, rolling windows, training window, maintenance windows, labelling options).
+
+### Imported NiaNetVAE per-cycle models (per_maint)
+To consume pretrained artifacts exported from `NiaNetVAE`:
+1. Set `EXPERIMENT_MODE="per_maint"`.
+2. Set `PER_MAINT_USE_IMPORTED_MODELS=True`.
+3. Set `PER_MAINT_MODEL_MANIFEST_PATH` to exported `cycle_manifest.json`.
+4. Keep `PER_MAINT_MODEL_STRICT=True` for production (fails fast on missing model artifacts).
+
+In this mode, metropt resolves cycle models from the manifest (including alias cycles) and uses them in fixed inference mode (no model weight updates in this repository).
+
+#### Recommended local setup (Windows dedicated venv)
+Use a dedicated Python 3.11 virtual environment for metropt imported-mode evaluation to avoid changing your existing interpreter:
+
+```powershell
+cd <path-to>\metropt-pdm-framework
+py -3.11 -m venv .venv-metropt
+.\.venv-metropt\Scripts\Activate.ps1
+pip install numpy pandas scikit-learn matplotlib torch lightning
+pip install -e ..\NiaNetVAE
+```
+
+Then in PyCharm:
+- create a dedicated run configuration for imported mode,
+- select interpreter `.\.venv-metropt\Scripts\python.exe`,
+- keep defaults in code unchanged, and set imported-mode flags only in that run profile.
+
+#### Manifest ownership and sync workflow
+1. Generate `cycle_manifest.json` on HPC using `python -m nianetvae.tools.generate_cycle_manifest`.
+2. Copy from HPC to laptop:
+   - `logs/per_maint_models/MetroPT/cycle_XX/*`
+   - `logs/per_maint_models/MetroPT/cycle_manifest.json`
+3. Point `PER_MAINT_MODEL_MANIFEST_PATH` to the local copied manifest.
+
+The manifest contains explicit `trained` / `alias` / `missing` cycle states; strict mode requires all needed cycles to resolve.
 
 ### Key Files
 - `main.py` – main workflow runner (loading → features → model → risk → plotting).

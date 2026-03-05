@@ -1,0 +1,54 @@
+[tool.poetry]
+name = "metropt-pdm-framework"
+version = "0.1.0"
+description = ""
+authors = ["Sašo Pavlič <saso.pavlic3@gmail.com>"]
+readme = "README.md"
+packages = [{include = "metropt_pdm_framework"}]
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.12"
+setuptools = "^67.8.0"
+pyyaml = "^6.0"
+#torch = "^2.0.1"
+#poethepoet = "*"
+torch = "*"
+poethepoet = "*"
+torchvision = "*"
+numpy = "^1.24.3"
+torchmetrics = "^1.6.1"
+tabulate = "^0.9.0"
+pandas = "^2.0.1"
+scipy = "^1.10.1"
+scikit-learn = "^1.2.2"
+matplotlib = "^3.7.1"
+niapy = "^2.0.5"
+lightning = "^2.0.2"
+pillow = "^9.5.0"
+tensorboard = "^2.13.0"
+pytest = "^7.3.1"
+colorama = "^0.4.6"
+deap = "^1.3.3"
+jupyter = "^1.0.0"
+pymannkendall = "^1.4.3"
+mk = "^2.4.1"
+seaborn = "^0.13.0"
+plotly = "^5.18.0"
+termcolor = "^2.4.0"
+statsmodels = "^0.14.3"
+# termcolor and statsmodels can be deleted after CARLA repository is not tested with same poetry enviroment.
+tables = "^3.10.1"
+pymoo = "^0.6.1.3"
+psycopg2-binary = "==2.9.10"
+pandas-stubs = "~=2.2.3"
+ruff = "^0.15.4"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poe.tasks]
+install-ltt = "python -m pip install light-the-torch"
+run-ltt = "python -m light_the_torch install --upgrade torch torchaudio torchvision"
+autoinstall-torch-cuda = ["install-ltt", "run-ltt"]

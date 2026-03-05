@@ -13,10 +13,11 @@ Single-series anomaly explorer (native timeline plot, MetroPT-3).
 from __future__ import annotations
 
 import argparse
+import json
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -88,6 +89,13 @@ def _mode_output_path(path: Optional[str], mode: str) -> Optional[str]:
     return str(p / f"{mode}.png")
 
 
+def _effective_detector_type(mode: str) -> str:
+    mode_norm = str(mode).strip().lower()
+    if mode_norm == "per_maint" and PER_MAINT_USE_IMPORTED_MODELS:
+        return "nianetvae"
+    return DETECTOR_TYPE
+
+
 
 
 def _log_pipeline_overview() -> None:
@@ -144,6 +152,11 @@ SAVE_FEATURES_CSV_PATH: Optional[str] = "datasets/metropt3_features.csv"
 #   training days for each cycle (plus an initial pre-W1 model).
 EXPERIMENT_MODE: str = "per_maint"
 
+# Pretrained per-maint model handoff (manifest-driven)
+PER_MAINT_USE_IMPORTED_MODELS: bool = True
+PER_MAINT_MODEL_MANIFEST_PATH: Optional[str] = r'C:\Users\sasop\PycharmProjects\NiaNetVAE\logs\per_maint_models\MetroPT\cycle_manifest.json'
+PER_MAINT_MODEL_STRICT: bool = True
+
 # Detector backend ("iforest" now, "autoencoder" later)
 DETECTOR_TYPE: str = "autoencoder"
 
@@ -159,7 +172,7 @@ AE_LATENT_DIM: Optional[int] = 48  # defaults to features // 2 (n_features = (# 
 AE_BETA: float = 0.01
 AE_EPOCHS: int = 20
 AE_BATCH_SIZE: int = 256
-AE_NUM_WORKERS: int = 8
+AE_NUM_WORKERS: int = 0
 AE_PIN_MEMORY: bool = True
 AE_PERSISTENT_WORKERS: bool = True
 AE_LR: float = 1e-3
@@ -429,6 +442,117 @@ def _ensure_bool_mask(mask: object, index: pd.Index) -> pd.Series:
             raise ValueError("Mask length does not match index length.")
         out = pd.Series(arr, index=index)
     return out.astype(bool)
+
+
+def _cycle_key(cycle_id: int) -> str:
+    return f"{int(cycle_id):02d}"
+
+
+def _load_cycle_manifest(path: str) -> tuple[dict, Path]:
+    p = Path(path).resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"PER_MAINT_MODEL_MANIFEST_PATH not found: {p}")
+    payload = json.loads(p.read_text(encoding="utf-8"))
+    if "cycles" not in payload or not isinstance(payload["cycles"], dict):
+        raise ValueError(f"Invalid cycle manifest format at {p}: missing 'cycles' object.")
+    return payload, p.parent
+
+
+def _resolve_manifest_path(
+    raw_path: Optional[str],
+    manifest_dir: Path,
+    cycle_id: Optional[int] = None,
+) -> Optional[str]:
+    if not raw_path:
+        return None
+    candidate = Path(raw_path)
+    if not candidate.is_absolute():
+        return str((manifest_dir / candidate).resolve())
+
+    if candidate.exists():
+        return str(candidate.resolve())
+
+    # Backward compatibility for old HPC-generated absolute Linux paths copied to another machine.
+    fallbacks = []
+    cycle_fragment = None
+    for idx, part in enumerate(candidate.parts):
+        if str(part).startswith("cycle_"):
+            cycle_fragment = Path(*candidate.parts[idx:])
+            break
+    if cycle_fragment is not None:
+        fallbacks.append((manifest_dir / cycle_fragment).resolve())
+
+    if cycle_id is not None:
+        fallbacks.append((manifest_dir / f"cycle_{_cycle_key(cycle_id)}" / candidate.name).resolve())
+
+    fallbacks.append((manifest_dir / candidate.name).resolve())
+    for fallback in fallbacks:
+        if fallback.exists():
+            return str(fallback)
+
+    return str(candidate)
+
+
+def _resolve_manifest_cycle(
+    manifest: dict,
+    manifest_dir: Path,
+    cycle_id: int,
+    strict: bool,
+    visited: Optional[set] = None,
+) -> Optional[dict]:
+    visited = visited or set()
+    key = _cycle_key(cycle_id)
+    if key in visited:
+        raise ValueError(f"Cycle alias loop detected while resolving cycle={key}.")
+    visited.add(key)
+
+    entry = manifest.get("cycles", {}).get(key)
+    if entry is None:
+        if strict:
+            raise KeyError(f"Cycle {key} not present in manifest.")
+        return None
+
+    status = str(entry.get("status", "")).strip().lower()
+    if status == "trained":
+        model_path = _resolve_manifest_path(entry.get("model_path"), manifest_dir, cycle_id=int(cycle_id))
+        meta_path = _resolve_manifest_path(entry.get("meta_path"), manifest_dir, cycle_id=int(cycle_id))
+        if not model_path or not meta_path:
+            if strict:
+                raise ValueError(f"Cycle {key} is trained but model_path/meta_path are missing.")
+            return None
+        model_exists = Path(model_path).exists()
+        meta_exists = Path(meta_path).exists()
+        if strict and (not model_exists or not meta_exists):
+            raise FileNotFoundError(
+                f"Cycle {key} paths do not exist after resolution: "
+                f"model_path={model_path} (exists={model_exists}), "
+                f"meta_path={meta_path} (exists={meta_exists})"
+            )
+        if not strict and (not model_exists or not meta_exists):
+            return None
+        resolved = dict(entry)
+        resolved["resolved_cycle_id"] = int(entry.get("cycle_id", int(cycle_id)))
+        resolved["model_path"] = model_path
+        resolved["meta_path"] = meta_path
+        return resolved
+
+    if status == "alias":
+        alias_to = entry.get("alias_to")
+        if alias_to is None:
+            if strict:
+                raise ValueError(f"Cycle {key} has status=alias but no alias_to.")
+            return None
+        return _resolve_manifest_cycle(
+            manifest=manifest,
+            manifest_dir=manifest_dir,
+            cycle_id=int(alias_to),
+            strict=strict,
+            visited=visited,
+        )
+
+    if strict:
+        raise ValueError(f"Cycle {key} unavailable in manifest (status={status!r}).")
+    return None
 
 
 def _evaluate_risk_series(
@@ -777,6 +901,34 @@ def _run_per_maintenance_experiment(
     pre_w1_test_mask = (index < first_start) & (~initial_train_order_mask)
     current_train_mask = initial_train_mask
 
+    use_imported_models = bool(PER_MAINT_USE_IMPORTED_MODELS)
+    detector_type_runtime = DETECTOR_TYPE
+    detector_kwargs_runtime: Dict[str, object] = dict(DETECTOR_KWARGS)
+    manifest_payload: Optional[dict] = None
+    manifest_dir: Optional[Path] = None
+    if use_imported_models:
+        if not PER_MAINT_MODEL_MANIFEST_PATH:
+            raise ValueError(
+                "PER_MAINT_USE_IMPORTED_MODELS=True requires PER_MAINT_MODEL_MANIFEST_PATH."
+            )
+        manifest_payload, manifest_dir = _load_cycle_manifest(PER_MAINT_MODEL_MANIFEST_PATH)
+        detector_type_runtime = "nianetvae"
+        detector_kwargs_runtime = {
+            "device": AE_DEVICE,
+            "use_scaler": True,
+            "batch_size": AE_BATCH_SIZE,
+            "sequence_len": AE_SEQUENCE_LEN,
+            "stride": AE_STRIDE,
+            "score_stride": AE_SCORE_STRIDE,
+            "num_workers": AE_NUM_WORKERS,
+            "persistent_workers": AE_PERSISTENT_WORKERS,
+            "pin_memory": AE_PIN_MEMORY,
+        }
+        print(
+            f"[INFO] Per-maint imported-model mode enabled. "
+            f"Manifest={Path(PER_MAINT_MODEL_MANIFEST_PATH).resolve()}"
+        )
+
     def _is_trainable(train_mask: pd.Series, test_mask: pd.Series) -> bool:
         train_mask = _ensure_bool_mask(train_mask, index)
         test_mask = _ensure_bool_mask(test_mask, index)
@@ -835,7 +987,10 @@ def _run_per_maintenance_experiment(
 
     # Helper: fit the detector on X_train and score X_test; update per-point predictions.
     def _fit_and_score_segment(
-        seg_label: str, train_mask: pd.Series, test_mask: pd.Series
+        seg_label: str,
+        train_mask: pd.Series,
+        test_mask: pd.Series,
+        requested_cycle_id: Optional[int] = None,
     ) -> Optional[dict]:
         nonlocal pred, risk_segments
 
@@ -851,18 +1006,49 @@ def _run_per_maintenance_experiment(
             return None
         nonlocal model_idx
         model_idx += 1
+        segment_action = "Calibrate+score" if use_imported_models else "Train+score"
         print(
-            f"[INFO] Training model {model_idx}/{total_models}: {seg_label} (train_size={X_train.shape[0]}, test_size={X_test.shape[0]})"
+            f"[INFO] {segment_action} segment {model_idx}/{total_models}: "
+            f"{seg_label} (train_size={X_train.shape[0]}, test_size={X_test.shape[0]})"
         )
-        detector = get_detector(DETECTOR_TYPE, **DETECTOR_KWARGS)
+        detector_kwargs = dict(detector_kwargs_runtime)
+        resolved_cycle_id = None
+        if use_imported_models:
+            if manifest_payload is None or manifest_dir is None:
+                raise RuntimeError("Manifest resolver is not initialized.")
+            if requested_cycle_id is None:
+                raise ValueError(f"Imported mode requires requested_cycle_id for segment {seg_label}.")
+            resolved_entry = _resolve_manifest_cycle(
+                manifest=manifest_payload,
+                manifest_dir=manifest_dir,
+                cycle_id=int(requested_cycle_id),
+                strict=bool(PER_MAINT_MODEL_STRICT),
+            )
+            if resolved_entry is None:
+                print(
+                    f"[WARN] No manifest artifact for segment={seg_label} requested_cycle={requested_cycle_id}; "
+                    "skipping segment in non-strict mode."
+                )
+                return None
+            detector_kwargs["model_meta_path"] = resolved_entry["meta_path"]
+            detector_kwargs["model_path"] = resolved_entry["model_path"]
+            resolved_cycle_id = int(resolved_entry.get("resolved_cycle_id", requested_cycle_id))
+            print(
+                f"[INFO] Imported model: segment={seg_label} requested_cycle={requested_cycle_id} "
+                f"resolved_cycle={resolved_cycle_id}"
+            )
+
+        detector = get_detector(detector_type_runtime, **detector_kwargs)
         t_seg = None
-        if DETECTOR_TYPE == "autoencoder":
+        if detector_type_runtime in {"autoencoder", "ae", "nianetvae", "nianetvae_pretrained"}:
+            run_label = "Infer segment" if use_imported_models else "Run segment"
             t_seg = _log_step_start(
-                f"Train AE segment {seg_label} (train={X_train.shape[0]}, test={X_test.shape[0]})"
+                f"{run_label} {seg_label} (train={X_train.shape[0]}, test={X_test.shape[0]})"
             )
         slice_pred, info = train_and_score(detector, X_train, X_test)
         if t_seg is not None:
-            _log_step_end(f"Train AE segment {seg_label}", t_seg)
+            run_label = "Infer segment" if use_imported_models else "Run segment"
+            _log_step_end(f"{run_label} {seg_label}", t_seg)
 
         pred.loc[test_mask, "anom_score"] = slice_pred["anom_score"]
         pred.loc[test_mask, "is_anomaly"] = slice_pred["is_anomaly"]
@@ -881,10 +1067,17 @@ def _run_per_maintenance_experiment(
             "train_end": X_train.index.max(),
             "test_start": X_test.index.min(),
             "test_end": X_test.index.max(),
+            "requested_cycle_id": requested_cycle_id,
+            "resolved_cycle_id": resolved_cycle_id,
         }
 
     # Model 0: pre-W1 region, trained on the initial TRAIN_FRAC slice only.
-    seg_info = _fit_and_score_segment("pre_W1", current_train_mask, pre_w1_test_mask)
+    seg_info = _fit_and_score_segment(
+        "pre_W1",
+        current_train_mask,
+        pre_w1_test_mask,
+        requested_cycle_id=0,
+    )
     if seg_info:
         period_infos.append(seg_info)
 
@@ -894,7 +1087,12 @@ def _run_per_maintenance_experiment(
     for j, (start_ts, end_ts) in enumerate(zip(starts, ends)):
         # Score the maintenance window itself with the current model (risk only).
         maint_mask = (index >= pd.to_datetime(start_ts)) & (index <= pd.to_datetime(end_ts))
-        seg_info = _fit_and_score_segment(f"maint_{j + 1}", current_train_mask, maint_mask)
+        seg_info = _fit_and_score_segment(
+            f"maint_{j + 1}",
+            current_train_mask,
+            maint_mask,
+            requested_cycle_id=j,
+        )
         if seg_info:
             period_infos.append(seg_info)
 
@@ -920,7 +1118,12 @@ def _run_per_maintenance_experiment(
             # reuse the previous model (which already includes the global
             # baseline and its last post-maint block in its training mask).
             seg_label = f"gap_after_maint_{j + 1}"
-            seg_info = _fit_and_score_segment(seg_label, current_train_mask, gap_mask)
+            seg_info = _fit_and_score_segment(
+                seg_label,
+                current_train_mask,
+                gap_mask,
+                requested_cycle_id=j,
+            )
             if seg_info:
                 period_infos.append(seg_info)
             continue
@@ -942,7 +1145,12 @@ def _run_per_maintenance_experiment(
         test_mask_new = (index > train_end) & (index < gap_end if j < len(starts) - 1 else index <= gap_end)
 
         seg_label = f"after_maint_{j + 1}"
-        seg_info = _fit_and_score_segment(seg_label, train_mask_new, test_mask_new)
+        seg_info = _fit_and_score_segment(
+            seg_label,
+            train_mask_new,
+            test_mask_new,
+            requested_cycle_id=j + 1,
+        )
         if seg_info:
             period_infos.append(seg_info)
             current_train_mask = train_mask_new
@@ -988,7 +1196,7 @@ def _run_per_maintenance_experiment(
         lead_step_minutes=LEAD_STEP_MINUTES,
     )
     _print_event_extra_metrics("Per-maint", event_results)
-    _save_event_plots(event_results, mode="per_maint", detector=DETECTOR_TYPE)
+    _save_event_plots(event_results, mode="per_maint", detector=detector_type_runtime)
 
     if period_infos:
         n_used = len(period_infos)
@@ -1002,6 +1210,9 @@ def _run_per_maintenance_experiment(
     summary_info = {
         "mode": "per_maint",
         "n_segments": len(period_infos),
+        "imported_models": bool(use_imported_models),
+        "manifest_path": str(Path(PER_MAINT_MODEL_MANIFEST_PATH).resolve()) if use_imported_models else None,
+        "detector_type": detector_type_runtime,
     }
     summary_info["event_metrics"] = event_results
     return pred, summary_info, best_risk_threshold, predicted_phase
@@ -1039,10 +1250,16 @@ def main() -> None:
     df_plot = pred[["maintenance_risk"]].copy()
 
     effective_show_labels = bool(SHOW_WINDOW_LABELS or USE_DEFAULT_METROPT_WINDOWS)
-    save_fig_path = _output_path_with_detector(SAVE_FIG_PATH, EXPERIMENT_MODE, DETECTOR_TYPE)
+    effective_detector = _effective_detector_type(mode)
+    save_fig_path = _output_path_with_detector(SAVE_FIG_PATH, EXPERIMENT_MODE, effective_detector)
     if save_fig_path:
         Path(save_fig_path).parent.mkdir(parents=True, exist_ok=True)
-    detector_label = "VAE" if DETECTOR_TYPE == "autoencoder" else "IsolationForest"
+    if effective_detector in {"autoencoder", "ae"}:
+        detector_label = "VAE"
+    elif effective_detector in {"nianetvae", "nianetvae_pretrained"}:
+        detector_label = "NiaNetVAE"
+    else:
+        detector_label = "IsolationForest"
     plot_raw_timeline(
         df_plot,
         maint_windows,
@@ -1067,7 +1284,7 @@ def main() -> None:
             if null_cols:
                 out.loc[no_score, null_cols] = np.nan
         out.index.name = "timestamp"
-        pred_path = _pred_output_path(SAVE_PRED_CSV_PATH, EXPERIMENT_MODE, DETECTOR_TYPE)
+        pred_path = _pred_output_path(SAVE_PRED_CSV_PATH, EXPERIMENT_MODE, effective_detector)
         out.to_csv(pred_path)
 
     _log_step_end("Plot + save outputs", t_plot)
@@ -1106,5 +1323,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    with log_to_file(DETECTOR_TYPE, EXPERIMENT_MODE):
+    with log_to_file(_effective_detector_type(EXPERIMENT_MODE), EXPERIMENT_MODE):
         main()

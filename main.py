@@ -172,7 +172,7 @@ AE_LATENT_DIM: Optional[int] = 48  # defaults to features // 2 (n_features = (# 
 AE_BETA: float = 0.01
 AE_EPOCHS: int = 20
 AE_BATCH_SIZE: int = 256
-AE_NUM_WORKERS: int = 0
+AE_NUM_WORKERS: int = 1
 AE_PIN_MEMORY: bool = True
 AE_PERSISTENT_WORKERS: bool = True
 AE_LR: float = 1e-3

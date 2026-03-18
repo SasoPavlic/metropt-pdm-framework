@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Simple log tee helper to save latest run per detector + mode.
-"""
+"""Simple log tee helper to save latest run by detector group + regime."""
 
 from __future__ import annotations
 
@@ -29,13 +27,27 @@ class _Tee:
 def log_to_file(
     detector_type: str,
     experiment_mode: str,
-    logs_dir: Optional[str] = "logs",
+    artifacts_root: Optional[str] = "artifacts",
 ) -> Iterator[Path]:
-    log_dir = Path(logs_dir or "logs")
-    log_dir.mkdir(parents=True, exist_ok=True)
     detector = str(detector_type).lower().strip()
+    if detector in {"iforest", "isolation_forest", "isolationforest"}:
+        detector_group = "iforest"
+    elif detector in {"autoencoder", "ae", "nianetvae", "nianetvae_pretrained"}:
+        detector_group = "vae"
+    else:
+        detector_group = detector or "unknown"
+
     mode = str(experiment_mode).lower().strip()
-    log_path = log_dir / f"{detector}_{mode}.log"
+    if mode in {"per_maint", "per-maint", "permaint"}:
+        mode = "per_maint"
+    elif mode == "single":
+        mode = "single"
+    else:
+        mode = mode or "unknown"
+
+    log_dir = Path(artifacts_root or "artifacts") / detector_group / mode / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "run.log"
 
     orig_out, orig_err = sys.stdout, sys.stderr
     f = open(log_path, "w", encoding="utf-8")

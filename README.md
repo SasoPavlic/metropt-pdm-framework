@@ -14,7 +14,11 @@ The project ingests raw MetroPT telemetry, engineers rolling statistical feature
 4. **Detector training** – supports two regimes: a single global model (`EXPERIMENT_MODE="single"`) trained on the first `TRAIN_FRAC` minutes, or a sequence of per‑maintenance models (`"per_maint"`) trained on the initial baseline plus a short post‑maintenance interval for each cycle. The current implementation uses Isolation Forest via `detectors/iforest_detector.py`, but the pipeline is detector‑agnostic (`DETECTOR_TYPE`).
 5. **Maintenance context** – `build_operation_phase` encodes states (0 normal, 1 pre‑maintenance, 2 maintenance). `maintenance_risk` is the rolling average of extreme‑point exceedance (`risk_score >= RISK_EXCEEDANCE_QUANTILE`) over `RISK_WINDOW_MINUTES` minutes and serves as the early‑warning signal.
 6. **Risk threshold search** – `metrics_point.evaluate_risk_thresholds` tries a grid (`RISK_EVAL_GRID_SPEC`) and reports precision/recall/F1 along with TP/FP/FN counts for alarms versus maintenance windows.
-7. **Outputs** – `datasets/metropt3_features.csv` (opt.) with the engineered rolling stats, `datasets/metropt3_predictions.csv` (opt.) with scores/risk/phase, `<mode>_metropt3_raw.png` showing the risk timeline with failures, `<mode>_lead_time_distribution.png` for the lead-time histogram, `<mode>_pr_vs_lead_time.png` for precision/recall vs lead time, plus console `[INFO]` model settings and `[RISK]` summaries.
+7. **Outputs** – `datasets/metropt3_features.csv` (opt.) with the engineered rolling stats, plus unified runtime artifacts in `artifacts/<detector-group>/<mode>/`:
+   - `logs/run.log`
+   - `predictions/metropt3_predictions.csv` (opt.)
+   - `plots/metropt3_raw.png`, `plots/lead_time_distribution.png`, `plots/pr_vs_lead_time.png`
+   together with console `[INFO]` model settings and `[RISK]` summaries.
 
 ### Requirements
 ```
@@ -45,7 +49,7 @@ pip install -e ../NiaNetVAE
    ```bash
    python main.py
    ```
-   The script will emit `[INFO]`, `[METRIC]`, and `[RISK]` summaries, produce `datasets/metropt3_predictions.csv`, and save plots to `<mode>_metropt3_raw.png`, `<mode>_lead_time_distribution.png`, and `<mode>_pr_vs_lead_time.png`.
+   The script will emit `[INFO]`, `[METRIC]`, and `[RISK]` summaries and write outputs to `artifacts/<detector-group>/<mode>/` (logs, predictions, and plots).
 
 By default `EXPERIMENT_MODE` in `main.py` is set to `"single"` (one global model). Set it to `"per_maint"` to enable per‑maintenance models, where each cycle is trained on the initial baseline plus a post‑maintenance training interval.
 
@@ -54,9 +58,10 @@ Command-line arguments are not required, but you can tweak configuration constan
 ### Imported NiaNetVAE per-cycle models (per_maint)
 To consume pretrained artifacts exported from `NiaNetVAE`:
 1. Set `EXPERIMENT_MODE="per_maint"`.
-2. Set `PER_MAINT_USE_IMPORTED_MODELS=True`.
-3. Set `PER_MAINT_MODEL_MANIFEST_PATH` to exported `cycle_manifest.json`.
-4. Keep `PER_MAINT_MODEL_STRICT=True` for production (fails fast on missing model artifacts).
+2. Set `DETECTOR_TYPE="autoencoder"` (compatibility guard: imported mode is not allowed with `iforest`).
+3. Set `PER_MAINT_USE_IMPORTED_MODELS=True`.
+4. Set `PER_MAINT_MODEL_MANIFEST_PATH` to exported `cycle_manifest.json`.
+5. Keep `PER_MAINT_MODEL_STRICT=True` for production (fails fast on missing model artifacts).
 
 In this mode, metropt resolves cycle models from the manifest (including alias cycles) and uses them in fixed inference mode (no model weight updates in this repository).
 
@@ -102,7 +107,7 @@ The manifest contains explicit `trained` / `alias` / `missing` cycle states; str
 - `[RISK]` / `[RISK-PERMAINT]` console blocks: event-level performance of the rolling risk alarm (TP/FP/FN refer to maintenance events and alarm intervals, not individual rows).
 
 ### Large Files
-`datasets/MetroPT3.csv` and `datasets/metropt3_predictions.csv` can exceed GitHub’s 100 MB limit and should remain untracked (add to `.gitignore` or use Git LFS if they must be shared).
+`datasets/MetroPT3.csv`, prediction CSVs under `artifacts/`, and generated plots/logs under `artifacts/` can grow quickly and should remain untracked (add to `.gitignore` or use Git LFS if they must be shared).
 
 ### Roadmap
 - Parameter sweeps to balance precision vs recall (e.g., `TRAIN_FRAC`, `RISK_WINDOW_MINUTES`).

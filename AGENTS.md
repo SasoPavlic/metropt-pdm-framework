@@ -33,6 +33,7 @@
 
 ## Imported `NiaNetVAE` Compatibility Rules
 - Imported mode is enabled only in `per_maint` when `PER_MAINT_USE_IMPORTED_MODELS=True`.
+- Runtime guard expects `DETECTOR_TYPE` compatible with imported flow (`autoencoder`/`ae`/`nianetvae` aliases). It must fail-fast for incompatible combinations (e.g., `iforest` + imported flag).
 - Manifest contract expected by resolver:
   - top-level `cycles` object,
   - per-cycle `status` in `{trained, alias, missing}`,
@@ -48,20 +49,26 @@
 - Preserve `train_and_score` postprocessing contract unless explicitly migrating all call sites.
 - Add new metrics in dedicated metric modules and keep existing outputs backward compatible.
 
+## Local Execution Environment
+- For local commands in this workspace, use the dedicated Poetry interpreter:
+  - `/mnt/c/Users/sasop/AppData/Local/pypoetry/Cache/virtualenvs/metropt-pdm-framework-79LhM6yD-py3.11/Scripts/python.exe`
+- Optional shell helper for shorter commands:
+  - `PYTHON_BIN=/mnt/c/Users/sasop/AppData/Local/pypoetry/Cache/virtualenvs/metropt-pdm-framework-79LhM6yD-py3.11/Scripts/python.exe`
+
 ## Validation Expectations
 Run from repository root:
 - Main run smoke test:
-  - `python main.py`
+  - `$PYTHON_BIN main.py`
 - Imported-model smoke test:
-  - set `EXPERIMENT_MODE="per_maint"`, `PER_MAINT_USE_IMPORTED_MODELS=True`, and valid `PER_MAINT_MODEL_MANIFEST_PATH`, then run `python main.py`.
+  - set `EXPERIMENT_MODE="per_maint"`, `PER_MAINT_USE_IMPORTED_MODELS=True`, and valid `PER_MAINT_MODEL_MANIFEST_PATH`, then run `$PYTHON_BIN main.py`.
 - Verify outputs after run:
-  - log file in `logs/<detector>_<mode>.log`,
-  - predictions CSV in `datasets/` (if enabled),
-  - plots in `plots/` (if enabled),
+  - log file in `artifacts/<detector-group>/<mode>/logs/run.log`,
+  - predictions CSV in `artifacts/<detector-group>/<mode>/predictions/` (if enabled),
+  - plots in `artifacts/<detector-group>/<mode>/plots/` (if enabled),
   - no unresolved manifest cycles when strict mode is enabled.
 
 ## Generated Files and Large Artifacts
-- Treat `datasets/metropt3_predictions*.csv`, `plots/*.png`, and `logs/*.log` as generated outputs.
+- Treat `artifacts/**` and `datasets/metropt3_predictions*.csv` as generated outputs.
 - Avoid committing large generated datasets/predictions unless explicitly requested.
 - Keep source dataset immutable during implementation tasks.
 

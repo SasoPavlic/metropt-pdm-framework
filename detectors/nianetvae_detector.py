@@ -116,7 +116,11 @@ class NiaNetVAEPretrainedDetector(BaseDetector):
                 "n_features": int(self.meta.get("n_features")),
                 "seq_len": int(self.meta.get("seq_len")),
                 "batch_size": int(self.cfg.batch_size),
-            }
+            },
+            "model_params": {
+                # Old exports do not have mapping_version and are interpreted as legacy v1.
+                "mapping_version": str(self.meta.get("mapping_version", "v1")).strip().lower(),
+            },
         }
         model = RNNVAE(solution, **model_config)
         if not getattr(model, "is_valid", False):

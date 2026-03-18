@@ -59,34 +59,70 @@ def parse_risk_grid_spec(spec: str) -> List[float]:
 
 
 
-def _output_path_with_detector(path: Optional[str], mode: str, detector: str) -> Optional[str]:
+def _normalize_mode(mode: str) -> str:
+    key = str(mode).strip().lower()
+    if key in {"per_maint", "per-maint", "permaint"}:
+        return "per_maint"
+    if key == "single":
+        return "single"
+    return key or "unknown"
+
+
+def _detector_artifact_group(detector: str) -> str:
+    key = str(detector).strip().lower()
+    if key in {"iforest", "isolation_forest", "isolationforest"}:
+        return "iforest"
+    if key in {"autoencoder", "ae", "nianetvae", "nianetvae_pretrained"}:
+        return "vae"
+    return key or "unknown"
+
+
+def _artifact_subdir(mode: str, detector: str, kind: str) -> Path:
+    return Path(ARTIFACTS_ROOT) / _detector_artifact_group(detector) / _normalize_mode(mode) / kind
+
+
+def _ensure_artifact_tree(mode: str, detector: str) -> None:
+    # Create the full per-run artifact directory structure up-front.
+    root = Path(ARTIFACTS_ROOT)
+    root.mkdir(parents=True, exist_ok=True)
+    for kind in ("logs", "plots", "predictions"):
+        _artifact_subdir(mode, detector, kind).mkdir(parents=True, exist_ok=True)
+
+
+def _artifact_file_path(
+    path: Optional[str],
+    mode: str,
+    detector: str,
+    kind: str,
+    default_suffix: str,
+) -> Optional[str]:
     if not path:
         return None
-    p = Path(path)
-    stem = p.stem
-    suffix = p.suffix or ".png"
-    name = f"{stem}_{detector}_{mode}{suffix}"
-    return str(p.with_name(name))
+    src = Path(path)
+    filename = src.name
+    if not Path(filename).suffix:
+        filename = f"{filename}{default_suffix}"
+    return str(_artifact_subdir(mode, detector, kind) / filename)
+
+
+def _output_path_with_detector(path: Optional[str], mode: str, detector: str) -> Optional[str]:
+    return _artifact_file_path(
+        path=path,
+        mode=mode,
+        detector=detector,
+        kind="plots",
+        default_suffix=".png",
+    )
 
 
 def _pred_output_path(path: Optional[str], mode: str, detector: str) -> Optional[str]:
-    if not path:
-        return None
-    p = Path(path)
-    stem = p.stem
-    suffix = p.suffix or ".csv"
-    name = f"{stem}_{detector}_{mode}{suffix}"
-    return str(p.with_name(name))
-
-
-def _mode_output_path(path: Optional[str], mode: str) -> Optional[str]:
-    """Prefix output filename with the experiment mode while preserving directory."""
-    if not path:
-        return None
-    p = Path(path)
-    if p.suffix:
-        return str(p.with_name(f"{mode}_{p.name}"))
-    return str(p / f"{mode}.png")
+    return _artifact_file_path(
+        path=path,
+        mode=mode,
+        detector=detector,
+        kind="predictions",
+        default_suffix=".csv",
+    )
 
 
 def _effective_detector_type(mode: str) -> str:
@@ -94,6 +130,88 @@ def _effective_detector_type(mode: str) -> str:
     if mode_norm == "per_maint" and PER_MAINT_USE_IMPORTED_MODELS:
         return "nianetvae"
     return DETECTOR_TYPE
+
+
+def _config_error(message: str, hints: Optional[List[str]] = None) -> None:
+    print(f"[CONFIG-ERROR] {message}")
+    for hint in hints or []:
+        print(f"[CONFIG-ERROR] Hint: {hint}")
+    raise ValueError(message)
+
+
+def _validate_runtime_configuration(mode: str) -> None:
+    mode_norm = _normalize_mode(mode)
+    detector = str(DETECTOR_TYPE).strip().lower()
+    imported = bool(PER_MAINT_USE_IMPORTED_MODELS)
+
+    known_detectors = {
+        "iforest",
+        "isolation_forest",
+        "isolationforest",
+        "autoencoder",
+        "ae",
+        "nianetvae",
+        "nianetvae_pretrained",
+    }
+    imported_compatible = {"autoencoder", "ae", "nianetvae", "nianetvae_pretrained"}
+    if detector not in known_detectors:
+        _config_error(
+            f"Unsupported DETECTOR_TYPE={DETECTOR_TYPE!r}.",
+            [
+                "Use one of: iforest, autoencoder.",
+                "For imported NiaNetVAE flow, use DETECTOR_TYPE='autoencoder' and PER_MAINT_USE_IMPORTED_MODELS=True.",
+            ],
+        )
+
+    if mode_norm == "single":
+        if detector in {"nianetvae", "nianetvae_pretrained"}:
+            _config_error(
+                f"DETECTOR_TYPE={DETECTOR_TYPE!r} is not supported in single mode.",
+                [
+                    "Use DETECTOR_TYPE='iforest' or 'autoencoder' for EXPERIMENT_MODE='single'.",
+                    "If you want imported NiaNetVAE models, switch to EXPERIMENT_MODE='per_maint'.",
+                ],
+            )
+        if imported:
+            print("[CONFIG-WARN] PER_MAINT_USE_IMPORTED_MODELS=True is ignored in single mode.")
+        return
+
+    if mode_norm != "per_maint":
+        _config_error(
+            f"Unsupported EXPERIMENT_MODE={mode!r}.",
+            ["Use EXPERIMENT_MODE='single' or EXPERIMENT_MODE='per_maint'."],
+        )
+
+    if imported:
+        if detector not in imported_compatible:
+            _config_error(
+                f"Invalid combination: EXPERIMENT_MODE='per_maint', DETECTOR_TYPE={DETECTOR_TYPE!r}, "
+                "PER_MAINT_USE_IMPORTED_MODELS=True.",
+                [
+                    "For per-maint IF training: set PER_MAINT_USE_IMPORTED_MODELS=False.",
+                    "For per-maint imported NiaNetVAE inference: set DETECTOR_TYPE='autoencoder' and keep PER_MAINT_USE_IMPORTED_MODELS=True.",
+                ],
+            )
+        if not PER_MAINT_MODEL_MANIFEST_PATH:
+            _config_error(
+                "PER_MAINT_MODEL_MANIFEST_PATH is required when PER_MAINT_USE_IMPORTED_MODELS=True.",
+                ["Set PER_MAINT_MODEL_MANIFEST_PATH to cycle_manifest.json exported from NiaNetVAE."],
+            )
+        manifest_path = Path(str(PER_MAINT_MODEL_MANIFEST_PATH)).expanduser()
+        if not manifest_path.exists():
+            _config_error(
+                f"Manifest path does not exist: {manifest_path}",
+                ["Verify path and that cycle artifacts + cycle_manifest.json were copied locally."],
+            )
+    else:
+        if detector in {"nianetvae", "nianetvae_pretrained"}:
+            _config_error(
+                f"DETECTOR_TYPE={DETECTOR_TYPE!r} requires PER_MAINT_USE_IMPORTED_MODELS=True.",
+                [
+                    "Set PER_MAINT_USE_IMPORTED_MODELS=True and provide PER_MAINT_MODEL_MANIFEST_PATH.",
+                    "Or switch DETECTOR_TYPE to 'iforest'/'autoencoder' for local training.",
+                ],
+            )
 
 
 
@@ -138,12 +256,15 @@ def _print_section(title: str) -> None:
 INPUT_TIMESTAMP_COL: Optional[str] = None
 # Whether to drop unnamed index columns commonly created by pandas when saving CSVs.
 DROP_UNNAMED_INDEX: bool = True
+# Unified output root:
+# artifacts/<detector-group>/<regime>/{logs,plots,predictions}
+ARTIFACTS_ROOT: str = "artifacts"
 # Input/outputs
 INPUT_PATH: str = "datasets/MetroPT3.csv"
-SAVE_FIG_PATH: Optional[str] = "plots/metropt3_raw.png"
-SAVE_LEAD_TIME_DIST_PATH: Optional[str] = "plots/lead_time_distribution.png"
-SAVE_PR_LEADTIME_PATH: Optional[str] = "plots/pr_vs_lead_time.png"
-SAVE_PRED_CSV_PATH: Optional[str] = "datasets/metropt3_predictions.csv"
+SAVE_FIG_PATH: Optional[str] = "metropt3_raw.png"
+SAVE_LEAD_TIME_DIST_PATH: Optional[str] = "lead_time_distribution.png"
+SAVE_PR_LEADTIME_PATH: Optional[str] = "pr_vs_lead_time.png"
+SAVE_PRED_CSV_PATH: Optional[str] = "metropt3_predictions.csv"
 SAVE_FEATURES_CSV_PATH: Optional[str] = "datasets/metropt3_features.csv"
 
 # Experiment mode:
@@ -154,7 +275,7 @@ EXPERIMENT_MODE: str = "per_maint"
 
 # Pretrained per-maint model handoff (manifest-driven)
 PER_MAINT_USE_IMPORTED_MODELS: bool = True
-PER_MAINT_MODEL_MANIFEST_PATH: Optional[str] = r'C:\Users\sasop\PycharmProjects\NiaNetVAE\logs\per_maint_models\MetroPT\cycle_manifest.json'
+PER_MAINT_MODEL_MANIFEST_PATH: Optional[str] = r'C:\Users\sasop\CodexProjects\nianet\NiaNetVAE\logs\per_maint_models\MetroPT\cycle_manifest.json'
 PER_MAINT_MODEL_STRICT: bool = True
 
 # Detector backend ("iforest" now, "autoencoder" later)
@@ -740,20 +861,20 @@ def _save_event_plots(event_results: dict, mode: str, detector: str) -> None:
     pr_path = _output_path_with_detector(SAVE_PR_LEADTIME_PATH, mode, detector)
 
     if dist_path:
-        Path(dist_path).parent.mkdir(parents=True, exist_ok=True)
         plot_lead_time_distribution(
             dist,
             save_fig=dist_path,
             title=f"Lead Time Distribution ({detector}, {mode})",
         )
+        print(f"[INFO] Saved plot: {Path(dist_path).resolve()}")
 
     if pr_path:
-        Path(pr_path).parent.mkdir(parents=True, exist_ok=True)
         plot_pr_vs_lead_time(
             pr,
             save_fig=pr_path,
             title=f"Precision-Recall vs Lead Time ({detector}, {mode})",
         )
+        print(f"[INFO] Saved plot: {Path(pr_path).resolve()}")
 
 
 def _run_single_model_experiment(
@@ -1219,20 +1340,24 @@ def _run_per_maintenance_experiment(
 
 
 def main() -> None:
-    # 1) Build rolling feature matrix and maintenance context
-    _log_pipeline_overview()
-    t_build = _log_step_start("Build features + context")
-    X, maint_windows, operation_phase = _build_features_and_context()
-    _log_step_end("Build features + context", t_build)
-
-    # 2) Run the selected experiment mode
+    # 1) Resolve run mode and initialize artifact directories.
     mode = EXPERIMENT_MODE.lower().strip()
     if mode not in {"single", "per_maint"}:
         raise ValueError(
             f"Unsupported EXPERIMENT_MODE={EXPERIMENT_MODE!r}; "
             f"use 'single' or 'per_maint'."
         )
+    _validate_runtime_configuration(mode)
+    effective_detector = _effective_detector_type(mode)
+    _ensure_artifact_tree(mode=mode, detector=effective_detector)
 
+    # 2) Build rolling feature matrix and maintenance context
+    _log_pipeline_overview()
+    t_build = _log_step_start("Build features + context")
+    X, maint_windows, operation_phase = _build_features_and_context()
+    _log_step_end("Build features + context", t_build)
+
+    # 3) Run the selected experiment mode
     t_run = _log_step_start("Run experiment")
     if mode == "single":
         pred, info, train_cutoff_ts, best_risk_threshold, predicted_phase = _run_single_model_experiment(
@@ -1245,15 +1370,12 @@ def main() -> None:
         train_cutoff_ts = None
     _log_step_end("Run experiment", t_run)
 
-    # 3) Plot risk timeline
+    # 4) Plot risk timeline
     t_plot = _log_step_start("Plot + save outputs")
     df_plot = pred[["maintenance_risk"]].copy()
 
     effective_show_labels = bool(SHOW_WINDOW_LABELS or USE_DEFAULT_METROPT_WINDOWS)
-    effective_detector = _effective_detector_type(mode)
-    save_fig_path = _output_path_with_detector(SAVE_FIG_PATH, EXPERIMENT_MODE, effective_detector)
-    if save_fig_path:
-        Path(save_fig_path).parent.mkdir(parents=True, exist_ok=True)
+    save_fig_path = _output_path_with_detector(SAVE_FIG_PATH, mode, effective_detector)
     if effective_detector in {"autoencoder", "ae"}:
         detector_label = "VAE"
     elif effective_detector in {"nianetvae", "nianetvae_pretrained"}:
@@ -1274,8 +1396,10 @@ def main() -> None:
         early_warning_minutes=PRE_MAINTENANCE_MINUTES,
         detector_name=detector_label,
     )
+    if save_fig_path:
+        print(f"[INFO] Saved plot: {Path(save_fig_path).resolve()}")
 
-    # 4) Optional: save per-point predictions (timestamp, score, labels, risk)
+    # 5) Optional: save per-point predictions (timestamp, score, labels, risk)
     if SAVE_PRED_CSV_PATH:
         out = pred.copy()
         if "anom_score" in out.columns:
@@ -1284,7 +1408,7 @@ def main() -> None:
             if null_cols:
                 out.loc[no_score, null_cols] = np.nan
         out.index.name = "timestamp"
-        pred_path = _pred_output_path(SAVE_PRED_CSV_PATH, EXPERIMENT_MODE, effective_detector)
+        pred_path = _pred_output_path(SAVE_PRED_CSV_PATH, mode, effective_detector)
         out.to_csv(pred_path)
 
     _log_step_end("Plot + save outputs", t_plot)
@@ -1323,5 +1447,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    with log_to_file(_effective_detector_type(EXPERIMENT_MODE), EXPERIMENT_MODE):
+    with log_to_file(_effective_detector_type(EXPERIMENT_MODE), EXPERIMENT_MODE, artifacts_root=ARTIFACTS_ROOT):
         main()

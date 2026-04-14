@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import time
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -55,6 +57,36 @@ def parse_risk_grid_spec(spec: str) -> List[float]:
     return values
 
 
+def _set_global_seed(seed: int) -> None:
+    """Best-effort deterministic seeding for fair/reproducible comparisons."""
+    random.seed(seed)
+    np.random.seed(seed)
+    try:
+        import torch
+
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except Exception:
+            pass
+        try:
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    try:
+        from lightning import seed_everything
+
+        seed_everything(seed, workers=True)
+    except Exception:
+        pass
+
+
 
 
 
@@ -78,7 +110,7 @@ def _detector_artifact_group(detector: str) -> str:
 
 
 def _artifact_subdir(mode: str, detector: str, kind: str) -> Path:
-    return Path(ARTIFACTS_ROOT) / _detector_artifact_group(detector) / _normalize_mode(mode) / kind
+    return Path(ARTIFACTS_ROOT) / _detector_artifact_group(detector) / _resolve_artifact_mode(mode) / kind
 
 
 def _ensure_artifact_tree(mode: str, detector: str) -> None:
@@ -123,6 +155,48 @@ def _pred_output_path(path: Optional[str], mode: str, detector: str) -> Optional
         kind="predictions",
         default_suffix=".csv",
     )
+
+
+def _map_manifest_workflow_to_artifact_mode(workflow_mode: Optional[str]) -> Optional[str]:
+    if not workflow_mode:
+        return None
+    key = str(workflow_mode).strip().lower()
+    if "warmstart" in key:
+        return "per_maint_warmstart"
+    if "finetune" in key:
+        return "per_maint_finetune"
+    if "baseline" in key:
+        return "per_maint_baseline"
+    return None
+
+
+@lru_cache(maxsize=4)
+def _resolve_artifact_mode(mode: str) -> str:
+    mode_norm = _normalize_mode(mode)
+    if mode_norm != "per_maint" or not PER_MAINT_USE_IMPORTED_MODELS:
+        return mode_norm
+
+    manifest_path = str(PER_MAINT_MODEL_MANIFEST_PATH or "").strip()
+    if not manifest_path:
+        return mode_norm
+    try:
+        payload = json.loads(Path(manifest_path).expanduser().resolve().read_text(encoding="utf-8"))
+    except Exception:
+        return mode_norm
+
+    manifest_workflow = _map_manifest_workflow_to_artifact_mode(payload.get("workflow_mode"))
+    if manifest_workflow:
+        return manifest_workflow
+
+    cycles = payload.get("cycles")
+    if isinstance(cycles, dict):
+        for entry in cycles.values():
+            if not isinstance(entry, dict):
+                continue
+            cycle_mode = _map_manifest_workflow_to_artifact_mode(entry.get("experiment_mode"))
+            if cycle_mode:
+                return cycle_mode
+    return mode_norm
 
 
 def _effective_detector_type(mode: str) -> str:
@@ -274,12 +348,13 @@ SAVE_FEATURES_CSV_PATH: Optional[str] = "datasets/metropt3_features.csv"
 EXPERIMENT_MODE: str = "per_maint"
 
 # Pretrained per-maint model handoff (manifest-driven)
-PER_MAINT_USE_IMPORTED_MODELS: bool = True
+PER_MAINT_USE_IMPORTED_MODELS: bool = False
 PER_MAINT_MODEL_MANIFEST_PATH: Optional[str] = r'C:\Users\sasop\CodexProjects\nianet\NiaNetVAE\logs\per_maint_models\MetroPT\cycle_manifest.json'
 PER_MAINT_MODEL_STRICT: bool = True
 
 # Detector backend ("iforest" now, "autoencoder" later)
-DETECTOR_TYPE: str = "autoencoder"
+DETECTOR_TYPE: str = "iforest"
+GLOBAL_SEED: int = 42
 
 # Autoencoder / VAE settings (used when DETECTOR_TYPE="autoencoder")
 AE_SEQUENCE_LEN: int = 200
@@ -290,14 +365,14 @@ AE_HIDDEN_SIZE: int = 8
 AE_NUM_LAYERS: int = 2
 AE_BIDIRECTIONAL: bool = False
 AE_LATENT_DIM: Optional[int] = 48  # defaults to features // 2 (n_features = (# numeric sensors) × 6 = 96 features
-AE_BETA: float = 0.01
-AE_EPOCHS: int = 20
-AE_BATCH_SIZE: int = 256
+AE_BETA: float = 0.1
+AE_EPOCHS: int = 3
+AE_BATCH_SIZE: int = 64
 AE_NUM_WORKERS: int = 1
 AE_PIN_MEMORY: bool = True
 AE_PERSISTENT_WORKERS: bool = True
-AE_LR: float = 1e-3
-AE_WEIGHT_DECAY: float = 0.001
+AE_LR: float = 0.003
+AE_WEIGHT_DECAY: float = 0.0
 AE_DEVICE: str = "cuda"
 AE_MODEL_PATH: Optional[str] = None  # set to load a pretrained AE/VAE
 AE_LOAD_PRETRAINED: bool = True
@@ -1348,8 +1423,15 @@ def main() -> None:
             f"use 'single' or 'per_maint'."
         )
     _validate_runtime_configuration(mode)
+    _set_global_seed(GLOBAL_SEED)
     effective_detector = _effective_detector_type(mode)
+    artifact_mode = _resolve_artifact_mode(mode)
     _ensure_artifact_tree(mode=mode, detector=effective_detector)
+    if artifact_mode != _normalize_mode(mode):
+        print(
+            "[INFO] Artifact routing override from manifest workflow: "
+            f"mode={_normalize_mode(mode)} -> {artifact_mode}"
+        )
 
     # 2) Build rolling feature matrix and maintenance context
     _log_pipeline_overview()
@@ -1447,5 +1529,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    with log_to_file(_effective_detector_type(EXPERIMENT_MODE), EXPERIMENT_MODE, artifacts_root=ARTIFACTS_ROOT):
+    with log_to_file(
+        _effective_detector_type(EXPERIMENT_MODE),
+        _resolve_artifact_mode(EXPERIMENT_MODE),
+        artifacts_root=ARTIFACTS_ROOT,
+    ):
         main()

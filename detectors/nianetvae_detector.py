@@ -108,8 +108,11 @@ class NiaNetVAEPretrainedDetector(BaseDetector):
         from nianetvae.models.rnn_vae import RNNVAE
 
         solution = np.asarray(self.meta.get("solution"), dtype=float)
-        if solution.shape[0] != 7:
-            raise ValueError("NiaNetVAE model_meta.json must contain a 7-gene solution vector.")
+        if solution.shape[0] != int(RNNVAE.GENE_DIMENSION):
+            raise ValueError(
+                "NiaNetVAE model_meta.json must contain a "
+                f"{RNNVAE.GENE_DIMENSION}-gene solution vector."
+            )
 
         model_config = {
             "data_params": {

@@ -119,19 +119,26 @@ def calculate_first_alarm_accuracy(
     maintenance_windows: List[Tuple],
     early_warning_minutes: int,
 ) -> Dict:
-    """Fraction of TP events where first alarm starts within strict pre-window."""
+    """Fraction of TP events whose alarm interval starts within strict pre-window."""
     windows = _normalize_windows(maintenance_windows)
+    alarm_intervals = _alarm_intervals_from_mask(predictions.astype(bool))
     tp_events = 0
     first_alarm_in_window = 0
 
     for maint_start, maint_end in windows:
         warning_start = maint_start - pd.Timedelta(minutes=early_warning_minutes)
-        window_predictions = predictions.loc[warning_start:maint_start]
-        alarms_extended = window_predictions[window_predictions == 1]
-        if alarms_extended.empty:
+        # Event is TP if any alarm interval overlaps the strict TP window.
+        matching_starts = [
+            alarm_start
+            for alarm_start, alarm_end in alarm_intervals
+            if (alarm_start <= maint_start and alarm_end >= warning_start)
+        ]
+        if not matching_starts:
             continue
+
         tp_events += 1
-        first_alarm_time = alarms_extended.index[0]
+        # Use the true alarm start (interval start), not first sampled True in sliced view.
+        first_alarm_time = min(matching_starts)
         if warning_start <= first_alarm_time <= maint_start:
             first_alarm_in_window += 1
 

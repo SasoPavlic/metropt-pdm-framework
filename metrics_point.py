@@ -6,7 +6,7 @@ Point-wise and risk-grid metrics for the anomaly detection pipeline.
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -39,9 +39,12 @@ def evaluate_risk_thresholds(
     maintenance_windows: List[Tuple],
     thresholds: List[float],
     early_warning_minutes: float = 120.0,
+    eval_mask: Optional[pd.Series] = None,
 ) -> List[dict]:
     """Evaluate maintenance_risk thresholds for early-warning detection."""
     risk = risk.sort_index().astype(float).fillna(0.0)
+    if eval_mask is not None:
+        eval_mask = eval_mask.reindex(risk.index).fillna(False).astype(bool)
     windows = []
     for w in maintenance_windows or []:
         if len(w) < 2:
@@ -54,13 +57,35 @@ def evaluate_risk_thresholds(
     horizon = pd.to_timedelta(float(max(0.0, early_warning_minutes)), unit="m")
 
     results: List[dict] = []
-    for theta in thresholds:
-        if theta is None:
+    for maintenance_risk_theta in thresholds:
+        if maintenance_risk_theta is None:
             continue
-        mask = (risk >= float(theta))
+        mask = risk >= float(maintenance_risk_theta)
+        if eval_mask is not None:
+            eval_total_points = int(eval_mask.sum())
+            eval_alarm_points = int((mask & eval_mask).sum())
+            mask = mask & eval_mask
+        else:
+            eval_total_points = int(mask.shape[0])
+            eval_alarm_points = int(mask.sum())
+
         intervals = _alarm_intervals_from_mask(mask)
         stats = _risk_scores(intervals, windows, horizon)
-        stats.update({"threshold": float(theta)})
+        coverage = (
+            float(eval_alarm_points) / float(eval_total_points)
+            if eval_total_points > 0
+            else 0.0
+        )
+        stats.update(
+            {
+                "threshold": float(maintenance_risk_theta),
+                "maintenance_risk_theta": float(maintenance_risk_theta),
+                "coverage": coverage,
+                "coverage_percent": coverage * 100.0,
+                "alarm_points": eval_alarm_points,
+                "total_points": eval_total_points,
+            }
+        )
         results.append(stats)
     return results
 

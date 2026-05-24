@@ -161,11 +161,17 @@ def _map_manifest_workflow_to_artifact_mode(workflow_mode: Optional[str]) -> Opt
     if not workflow_mode:
         return None
     key = str(workflow_mode).strip().lower()
-    if "warmstart" in key:
+    if key == "per_maint_warmstart_search":
+        return "per_maint_warmstart_search"
+    if key == "per_maint_finetune_search":
+        return "per_maint_finetune_search"
+    if key == "per_maint_baseline_search":
+        return "per_maint_baseline_search"
+    if key in {"per_maint_warmstart", "warmstart_search"} or "warmstart" in key:
         return "per_maint_warmstart"
-    if "finetune" in key:
+    if key in {"per_maint_finetune", "finetune_search"} or "finetune" in key:
         return "per_maint_finetune"
-    if "baseline" in key:
+    if key in {"per_maint_baseline", "baseline_search"} or "baseline" in key:
         return "per_maint_baseline"
     return None
 
@@ -217,6 +223,16 @@ def _validate_runtime_configuration(mode: str) -> None:
     mode_norm = _normalize_mode(mode)
     detector = str(DETECTOR_TYPE).strip().lower()
     imported = bool(PER_MAINT_USE_IMPORTED_MODELS)
+
+    if int(PRE_MAINTENANCE_MINUTES) != int(THRESHOLD_POLICY_FIXED_LEAD_MINUTES):
+        _config_error(
+            "PRE_MAINTENANCE_MINUTES must equal THRESHOLD_POLICY_FIXED_LEAD_MINUTES "
+            "for locked S1-T4 evaluation policy.",
+            [
+                f"Set PRE_MAINTENANCE_MINUTES={THRESHOLD_POLICY_FIXED_LEAD_MINUTES}.",
+                "Or deliberately update both values together if policy changes.",
+            ],
+        )
 
     known_detectors = {
         "iforest",
@@ -348,12 +364,12 @@ SAVE_FEATURES_CSV_PATH: Optional[str] = "datasets/metropt3_features.csv"
 EXPERIMENT_MODE: str = "per_maint"
 
 # Pretrained per-maint model handoff (manifest-driven)
-PER_MAINT_USE_IMPORTED_MODELS: bool = False
-PER_MAINT_MODEL_MANIFEST_PATH: Optional[str] = r'C:\Users\sasop\CodexProjects\nianet\NiaNetVAE\logs\per_maint_models\MetroPT\cycle_manifest.json'
+PER_MAINT_USE_IMPORTED_MODELS: bool = True
+PER_MAINT_MODEL_MANIFEST_PATH: Optional[str] = r'C:\Users\sasop\CodexProjects\nianet\NiaNetVAE\logs\per_maint_models_finetune_smoothed_rankgap\MetroPT\cycle_manifest.json'
 PER_MAINT_MODEL_STRICT: bool = True
 
 # Detector backend ("iforest" now, "autoencoder" later)
-DETECTOR_TYPE: str = "iforest"
+DETECTOR_TYPE: str = "autoencoder"
 GLOBAL_SEED: int = 42
 
 # Autoencoder / VAE settings (used when DETECTOR_TYPE="autoencoder")
@@ -364,9 +380,9 @@ AE_RNN_TYPE: str = "LSTM"
 AE_HIDDEN_SIZE: int = 8
 AE_NUM_LAYERS: int = 2
 AE_BIDIRECTIONAL: bool = False
-AE_LATENT_DIM: Optional[int] = 48  # defaults to features // 2 (n_features = (# numeric sensors) × 6 = 96 features
+AE_LATENT_DIM: Optional[int] = 48  # defaults to features // 2 (n_features = (# numeric sensors) * 6 = 96 features
 AE_BETA: float = 0.1
-AE_EPOCHS: int = 3
+AE_EPOCHS: int = 15
 AE_BATCH_SIZE: int = 64
 AE_NUM_WORKERS: int = 1
 AE_PIN_MEMORY: bool = True
@@ -436,7 +452,12 @@ RISK_WINDOW_MINUTES: int = 480
 # Quantile for extreme-point exceedance when building maintenance risk.
 RISK_EXCEEDANCE_QUANTILE: float = 0.90
 # Risk evaluation grid specification (start:stop:step).
-RISK_EVAL_GRID_SPEC: str = "0.30:0.90:0.10"
+RISK_EVAL_GRID_SPEC: str = "0.10:0.90:0.05"
+# Locked deterministic theta-selection policy (S1-T4).
+THRESHOLD_POLICY_FIXED_LEAD_MINUTES: int = 120
+THRESHOLD_POLICY_TARGET_RECALL: float = 0.60
+THRESHOLD_POLICY_TARGET_COVERAGE: float = 0.20
+THRESHOLD_POLICY_SENSITIVITY_LEADS: List[int] = [30, 60, 90]
 # Lead-time step size for event-level curves (minutes).
 LEAD_STEP_MINUTES: int = 30
 # Length of the post-maintenance training interval (in minutes) for the
@@ -755,6 +776,7 @@ def _evaluate_risk_series(
     maintenance_risk: pd.Series,
     maint_windows: List[Tuple],
     tag: str,
+    eval_mask: Optional[pd.Series] = None,
 ) -> Tuple[Optional[float], Optional[pd.Series], List[dict], Optional[dict]]:
     """Grid-search risk thresholds and return best stats."""
     risk_thresholds: List[float] = []
@@ -774,13 +796,53 @@ def _evaluate_risk_series(
         risk=maintenance_risk,
         maintenance_windows=maint_windows,
         thresholds=risk_thresholds,
-        early_warning_minutes=PRE_MAINTENANCE_MINUTES,
+        early_warning_minutes=THRESHOLD_POLICY_FIXED_LEAD_MINUTES,
+        eval_mask=eval_mask,
     )
     if not risk_results:
         return best_risk_threshold, predicted_phase, [], best_stats
 
-    best = max(risk_results, key=lambda r: (r["f1"], r["precision"], -r["threshold"]))
+    for row in risk_results:
+        row["target_gap"] = (
+            max(0.0, float(THRESHOLD_POLICY_TARGET_RECALL) - float(row.get("recall", 0.0)))
+            + max(0.0, float(row.get("coverage", 0.0)) - float(THRESHOLD_POLICY_TARGET_COVERAGE))
+        )
+
+    feasible = [
+        row
+        for row in risk_results
+        if float(row.get("recall", 0.0)) >= float(THRESHOLD_POLICY_TARGET_RECALL)
+        and float(row.get("coverage", 1.0)) < float(THRESHOLD_POLICY_TARGET_COVERAGE)
+    ]
+    if feasible:
+        best = max(
+            feasible,
+            key=lambda row: (
+                float(row.get("f1", 0.0)),
+                float(row.get("precision", 0.0)),
+                float(row.get("recall", 0.0)),
+                -float(row.get("threshold", 1e9)),
+            ),
+        )
+        selection_mode = "feasible"
+    else:
+        best = min(
+            risk_results,
+            key=lambda row: (
+                float(row.get("target_gap", 1e9)),
+                -float(row.get("f1", 0.0)),
+                -float(row.get("precision", 0.0)),
+                -float(row.get("recall", 0.0)),
+                float(row.get("threshold", 1e9)),
+            ),
+        )
+        selection_mode = "fallback"
+
     best_stats = dict(best)
+    best_stats["selection_mode"] = selection_mode
+    best_stats["fixed_lead_minutes"] = int(THRESHOLD_POLICY_FIXED_LEAD_MINUTES)
+    best_stats["target_recall"] = float(THRESHOLD_POLICY_TARGET_RECALL)
+    best_stats["target_coverage"] = float(THRESHOLD_POLICY_TARGET_COVERAGE)
     best_risk_threshold = float(best["threshold"])
     predicted_phase = (maintenance_risk >= best_risk_threshold).astype(bool)
     return best_risk_threshold, predicted_phase, risk_results, best_stats
@@ -834,18 +896,279 @@ def _print_event_level_metrics(
     _print_section(f"EVENT-LEVEL METRICS ({label})")
     print(
         f"Risk window={RISK_WINDOW_MINUTES} min  |  "
-        f"Pre-maint horizon={PRE_MAINTENANCE_MINUTES} min  |  "
+        f"Fixed lead={THRESHOLD_POLICY_FIXED_LEAD_MINUTES} min  |  "
         f"Exceedance quantile={RISK_EXCEEDANCE_QUANTILE:.2f}"
+    )
+    print(
+        "maintenance_risk_theta policy: feasible-first "
+        f"(recall>={THRESHOLD_POLICY_TARGET_RECALL:.2f}, "
+        f"coverage<{THRESHOLD_POLICY_TARGET_COVERAGE:.2f}), "
+        "fallback=lowest target_gap."
     )
     if best_stats:
         print(
-            f"Best θ={best_stats['threshold']:.2f}  "
+            f"Best maintenance_risk_theta={best_stats['threshold']:.2f}  "
+            f"mode={best_stats.get('selection_mode', 'n/a')}  "
             f"TP={best_stats['tp']}  FP={best_stats['fp']}  FN={best_stats['fn']}  "
             f"Precision={best_stats['precision']:.4f}  "
-            f"Recall={best_stats['recall']:.4f}  F1={best_stats['f1']:.4f}"
+            f"Recall={best_stats['recall']:.4f}  F1={best_stats['f1']:.4f}  "
+            f"Coverage={best_stats.get('coverage_percent', 0.0):.2f}%  "
+            f"target_gap={best_stats.get('target_gap', 0.0):.4f}"
         )
     else:
-        print("Best θ=N/A (no risk results)")
+        print("Best maintenance_risk_theta=N/A (no risk results)")
+
+
+def _extract_policy_metric_block(event_results: dict) -> dict:
+    event_scores = event_results.get("event_scores", {})
+    coverage = event_results.get("coverage", {})
+    far = event_results.get("far", {})
+    faa = event_results.get("first_alarm_accuracy", {})
+    nab = event_results.get("nab", {}).get("standard", {})
+    return {
+        "precision": float(event_scores.get("precision", 0.0)),
+        "recall": float(event_scores.get("recall", 0.0)),
+        "f1": float(event_scores.get("f1", 0.0)),
+        "coverage_percent": float(coverage.get("alarm_coverage_percent", 0.0)),
+        "far_per_week": far.get("far_per_week"),
+        "faa": faa.get("first_alarm_accuracy"),
+        "nab_standard": nab.get("nab_score_normalized"),
+        "tp": int(event_scores.get("tp", 0)),
+        "fp": int(event_scores.get("fp", 0)),
+        "fn": int(event_scores.get("fn", 0)),
+    }
+
+
+THETA_SWEEP_SUMMARY_METRICS: List[str] = [
+    "tp",
+    "fp",
+    "fn",
+    "precision",
+    "recall",
+    "f1",
+    "coverage",
+    "far_per_week",
+    "faa",
+    "nab_standard",
+    "target_gap",
+]
+
+THETA_SWEEP_HIGHER_IS_BETTER = {
+    "tp",
+    "precision",
+    "recall",
+    "f1",
+    "faa",
+    "nab_standard",
+}
+
+
+def _build_theta_sweep_summary(rows: List[dict]) -> pd.DataFrame:
+    """Summarize all theta-sweep numeric metrics without changing raw sweep rows."""
+    df = pd.DataFrame(rows)
+    if df.empty or "maintenance_risk_theta" not in df.columns:
+        return pd.DataFrame()
+
+    theta = pd.to_numeric(df["maintenance_risk_theta"], errors="coerce")
+    summary_rows = []
+    for metric in THETA_SWEEP_SUMMARY_METRICS:
+        if metric not in df.columns:
+            continue
+        values = pd.to_numeric(df[metric], errors="coerce")
+        metric_df = pd.DataFrame(
+            {
+                "maintenance_risk_theta": theta,
+                "value": values,
+            }
+        ).dropna()
+        if metric_df.empty:
+            continue
+
+        higher_is_better = metric in THETA_SWEEP_HIGHER_IS_BETTER
+        best_idx = metric_df["value"].idxmax() if higher_is_better else metric_df["value"].idxmin()
+        worst_idx = metric_df["value"].idxmin() if higher_is_better else metric_df["value"].idxmax()
+        metric_values = metric_df["value"]
+
+        summary_rows.append(
+            {
+                "metric": metric,
+                "direction": "higher_is_better" if higher_is_better else "lower_is_better",
+                "count": int(metric_values.count()),
+                "mean": float(metric_values.mean()),
+                "median": float(metric_values.median()),
+                "std": float(metric_values.std(ddof=0)),
+                "min": float(metric_values.min()),
+                "max": float(metric_values.max()),
+                "q25": float(metric_values.quantile(0.25)),
+                "q75": float(metric_values.quantile(0.75)),
+                "best_value": float(metric_df.loc[best_idx, "value"]),
+                "best_theta": float(metric_df.loc[best_idx, "maintenance_risk_theta"]),
+                "worst_value": float(metric_df.loc[worst_idx, "value"]),
+                "worst_theta": float(metric_df.loc[worst_idx, "maintenance_risk_theta"]),
+            }
+        )
+
+    return pd.DataFrame(summary_rows)
+
+
+def _print_theta_sweep_summary(summary: pd.DataFrame) -> None:
+    if summary.empty:
+        return
+
+    by_metric = {str(row["metric"]): row for _, row in summary.iterrows()}
+
+    def row(metric: str) -> Optional[pd.Series]:
+        return by_metric.get(metric)
+
+    _print_section("THETA-SWEEP SUMMARY")
+    for metric, label, third_stat in [
+        ("f1", "F1", "max"),
+        ("recall", "Recall", "max"),
+        ("coverage", "Coverage", "min"),
+        ("far_per_week", "FAR/week", "min"),
+        ("nab_standard", "NAB", "max"),
+    ]:
+        metric_row = row(metric)
+        if metric_row is None:
+            continue
+        print(
+            f"{label} mean={metric_row['mean']:.4f}  "
+            f"median={metric_row['median']:.4f}  "
+            f"{third_stat}={metric_row[third_stat]:.4f}  "
+            f"best={metric_row['best_value']:.4f} at theta={metric_row['best_theta']:.2f}"
+        )
+
+
+def _save_theta_sweep_summary(rows: List[dict], *, mode: str, detector: str) -> pd.DataFrame:
+    summary = _build_theta_sweep_summary(rows)
+    if summary.empty:
+        return summary
+
+    out_path = _pred_output_path("theta_sweep_summary.csv", mode, detector)
+    if not out_path:
+        return summary
+
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    summary.to_csv(out_path, index=False)
+    print(f"[INFO] Saved maintenance_risk_theta sweep summary: {out_path}")
+    return summary
+
+
+def _build_threshold_policy_report(
+    predicted_phase: Optional[pd.Series],
+    maint_windows: List[Tuple],
+    eval_mask: pd.Series,
+    best_stats: Optional[dict],
+    primary_event_results: dict,
+) -> Optional[dict]:
+    if predicted_phase is None or best_stats is None:
+        return None
+
+    selected_maintenance_risk_theta = float(best_stats.get("threshold", 0.0))
+    report = {
+        "fixed_lead_minutes": int(THRESHOLD_POLICY_FIXED_LEAD_MINUTES),
+        "selected_maintenance_risk_theta": selected_maintenance_risk_theta,
+        "selection_mode": best_stats.get("selection_mode"),
+        "target_recall": float(THRESHOLD_POLICY_TARGET_RECALL),
+        "target_coverage": float(THRESHOLD_POLICY_TARGET_COVERAGE),
+        "target_gap": float(best_stats.get("target_gap", 0.0)),
+        "primary": _extract_policy_metric_block(primary_event_results),
+        "sensitivity": [],
+    }
+
+    sensitivity_leads = sorted(
+        {
+            int(lead)
+            for lead in THRESHOLD_POLICY_SENSITIVITY_LEADS
+            if int(lead) > 0 and int(lead) != int(THRESHOLD_POLICY_FIXED_LEAD_MINUTES)
+        }
+    )
+    for lead in sensitivity_leads:
+        lead_results = evaluate_maintenance_prediction(
+            predictions=predicted_phase,
+            maintenance_windows=maint_windows,
+            early_warning_minutes=int(lead),
+            method_name=f"Sensitivity-{lead}",
+            eval_mask=eval_mask,
+            lead_step_minutes=max(1, min(int(LEAD_STEP_MINUTES), int(lead))),
+        )
+        row = _extract_policy_metric_block(lead_results)
+        row["lead_time_min"] = int(lead)
+        report["sensitivity"].append(row)
+
+    return report
+
+
+def _save_maintenance_risk_theta_sweep(
+    maintenance_risk: pd.Series,
+    maint_windows: List[Tuple],
+    eval_mask: pd.Series,
+    risk_results: List[dict],
+    best_stats: Optional[dict],
+    *,
+    mode: str,
+    detector: str,
+) -> None:
+    """Export the maintenance_risk threshold frontier used by the locked policy."""
+    if not risk_results:
+        return
+    out_path = _pred_output_path("theta_sweep_maintenance_risk.csv", mode, detector)
+    if not out_path:
+        return
+
+    selected_maintenance_risk_theta = None
+    selected_mode = None
+    if best_stats:
+        selected_maintenance_risk_theta = float(
+            best_stats.get("threshold", best_stats.get("maintenance_risk_theta", 0.0))
+        )
+        selected_mode = str(best_stats.get("selection_mode") or "")
+
+    rows = []
+    for row in risk_results:
+        theta = float(row.get("threshold", row.get("maintenance_risk_theta", 0.0)))
+        predicted = (maintenance_risk >= theta).astype(bool)
+        event_results = evaluate_maintenance_prediction(
+            predictions=predicted,
+            maintenance_windows=maint_windows,
+            early_warning_minutes=THRESHOLD_POLICY_FIXED_LEAD_MINUTES,
+            method_name=f"maintenance_risk_theta={theta:.6f}",
+            eval_mask=eval_mask,
+            lead_step_minutes=LEAD_STEP_MINUTES,
+        )
+        block = _extract_policy_metric_block(event_results)
+        feasible = (
+            float(row.get("recall", 0.0)) >= float(THRESHOLD_POLICY_TARGET_RECALL)
+            and float(row.get("coverage", 1.0)) < float(THRESHOLD_POLICY_TARGET_COVERAGE)
+        )
+        is_selected = (
+            selected_maintenance_risk_theta is not None
+            and abs(theta - selected_maintenance_risk_theta) <= 1e-12
+        )
+        selection_mode = selected_mode if is_selected else ("feasible" if feasible else "fallback_candidate")
+        rows.append(
+            {
+                "maintenance_risk_theta": theta,
+                "tp": int(row.get("tp", 0)),
+                "fp": int(row.get("fp", 0)),
+                "fn": int(row.get("fn", 0)),
+                "precision": float(row.get("precision", 0.0)),
+                "recall": float(row.get("recall", 0.0)),
+                "f1": float(row.get("f1", 0.0)),
+                "coverage": float(row.get("coverage", 0.0)),
+                "far_per_week": block.get("far_per_week"),
+                "faa": block.get("faa"),
+                "nab_standard": block.get("nab_standard"),
+                "target_gap": float(row.get("target_gap", 0.0)),
+                "selection_mode": selection_mode,
+            }
+        )
+
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(out_path, index=False)
+    print(f"[INFO] Saved maintenance_risk_theta sweep: {out_path}")
+    summary = _save_theta_sweep_summary(rows, mode=mode, detector=detector)
+    _print_theta_sweep_summary(summary)
 
 
 def _print_event_extra_metrics(label: str, event_results: dict) -> None:
@@ -884,7 +1207,7 @@ def _print_event_extra_metrics(label: str, event_results: dict) -> None:
         print(
             f"Coverage={cov['alarm_coverage_percent']:.2f}% "
             f"({cov['alarm_points']}/{cov['total_points']})  |  "
-            f"lower is better (ideal≈0%)"
+            f"lower is better (ideal~0%)"
         )
 
     if mtia.get("mtia_minutes") is not None:
@@ -988,8 +1311,12 @@ def _run_single_model_experiment(
     eval_exclude_mask = initial_train_time_mask | post_maint_train_mask
 
     # Event-level evaluation of maintenance_risk thresholds
+    eval_mask = ~eval_exclude_mask
     best_risk_threshold, predicted_phase, risk_results, best_stats = _evaluate_risk_series(
-        maintenance_risk, maint_windows, tag="RISK"
+        maintenance_risk,
+        maint_windows,
+        tag="RISK",
+        eval_mask=eval_mask,
     )
     _assign_exceedance(pred)
     _assign_predicted_phase(pred, predicted_phase)
@@ -1003,7 +1330,6 @@ def _run_single_model_experiment(
         train_cutoff_ts = None
 
     # Point-wise metrics on normal + pre-maintenance, excluding training-only rows
-    eval_mask = ~eval_exclude_mask
     m_all = _compute_pointwise_metrics(pred["is_anomaly"], pred["operation_phase"], eval_mask=eval_mask)
     threshold_info = None
     if info.get("threshold") is not None:
@@ -1015,12 +1341,28 @@ def _run_single_model_experiment(
     event_results = evaluate_maintenance_prediction(
         predictions=pred["predicted_phase"],
         maintenance_windows=maint_windows,
-        early_warning_minutes=PRE_MAINTENANCE_MINUTES,
+        early_warning_minutes=THRESHOLD_POLICY_FIXED_LEAD_MINUTES,
         method_name="Single",
         eval_mask=eval_mask,
         lead_step_minutes=LEAD_STEP_MINUTES,
     )
     info["event_metrics"] = event_results
+    info["threshold_policy"] = _build_threshold_policy_report(
+        predicted_phase=predicted_phase,
+        maint_windows=maint_windows,
+        eval_mask=eval_mask,
+        best_stats=best_stats,
+        primary_event_results=event_results,
+    )
+    _save_maintenance_risk_theta_sweep(
+        maintenance_risk=maintenance_risk,
+        maint_windows=maint_windows,
+        eval_mask=eval_mask,
+        risk_results=risk_results,
+        best_stats=best_stats,
+        mode="single",
+        detector=DETECTOR_TYPE,
+    )
     _print_event_extra_metrics("Single", event_results)
     _save_event_plots(event_results, mode="single", detector=DETECTOR_TYPE)
 
@@ -1073,7 +1415,7 @@ def _run_per_maintenance_experiment(
     if index.empty:
         raise ValueError("Empty index in per-maintenance experiment.")
 
-    # Initial training window (shared with the single-model regime) – this is
+    # Initial training window (shared with the single-model regime) - this is
     # the global baseline that every per-maintenance model sees.
     initial_train_time_mask = time_based_train_mask(index, TRAIN_FRAC)
     initial_train_order_mask = initial_train_time_mask.copy()
@@ -1362,15 +1704,18 @@ def _run_per_maintenance_experiment(
     pred["operation_phase"] = op_phase
 
     # Event-level evaluation of maintenance_risk thresholds
+    eval_mask = pred["is_anomaly"].notna() & (~global_train_for_eval)
     best_risk_threshold, predicted_phase, risk_results, best_stats = _evaluate_risk_series(
-        maintenance_risk, mw_sorted, tag="RISK-PERMAINT"
+        maintenance_risk,
+        mw_sorted,
+        tag="RISK-PERMAINT",
+        eval_mask=eval_mask,
     )
     _assign_exceedance(pred)
     _assign_predicted_phase(pred, predicted_phase)
 
     # Point-wise metrics on rows with predictions (normal + pre-maintenance only),
     # excluding all training-only rows (initial slice + post-maint training days).
-    eval_mask = pred["is_anomaly"].notna() & (~global_train_for_eval)
     m_all = _compute_pointwise_metrics(pred["is_anomaly"], pred["operation_phase"], eval_mask=eval_mask)
     threshold_info = None
     thresholds = [info["threshold"] for info in period_infos if info.get("threshold") is not None]
@@ -1386,10 +1731,26 @@ def _run_per_maintenance_experiment(
     event_results = evaluate_maintenance_prediction(
         predictions=pred["predicted_phase"],
         maintenance_windows=mw_sorted,
-        early_warning_minutes=PRE_MAINTENANCE_MINUTES,
+        early_warning_minutes=THRESHOLD_POLICY_FIXED_LEAD_MINUTES,
         method_name="Per-maint",
         eval_mask=eval_mask,
         lead_step_minutes=LEAD_STEP_MINUTES,
+    )
+    threshold_policy_report = _build_threshold_policy_report(
+        predicted_phase=predicted_phase,
+        maint_windows=mw_sorted,
+        eval_mask=eval_mask,
+        best_stats=best_stats,
+        primary_event_results=event_results,
+    )
+    _save_maintenance_risk_theta_sweep(
+        maintenance_risk=maintenance_risk,
+        maint_windows=mw_sorted,
+        eval_mask=eval_mask,
+        risk_results=risk_results,
+        best_stats=best_stats,
+        mode="per_maint",
+        detector=detector_type_runtime,
     )
     _print_event_extra_metrics("Per-maint", event_results)
     _save_event_plots(event_results, mode="per_maint", detector=detector_type_runtime)
@@ -1411,6 +1772,7 @@ def _run_per_maintenance_experiment(
         "detector_type": detector_type_runtime,
     }
     summary_info["event_metrics"] = event_results
+    summary_info["threshold_policy"] = threshold_policy_report
     return pred, summary_info, best_risk_threshold, predicted_phase
 
 

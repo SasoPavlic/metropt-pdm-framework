@@ -29,6 +29,17 @@ def test_evaluate_risk_thresholds_respects_eval_mask_for_coverage():
     assert row["maintenance_risk_theta"] == 0.5
 
 
+def test_risk_threshold_grid_includes_explicit_high_theta_probes():
+    thresholds = metropt_main.build_risk_threshold_grid(
+        "0.10:0.90:0.05",
+        [0.925, 0.95, 0.975, 0.985, 0.99, 0.995],
+    )
+
+    assert 0.90 in thresholds
+    assert thresholds[-6:] == [0.925, 0.95, 0.975, 0.985, 0.99, 0.995]
+    assert len(thresholds) == len(set(thresholds))
+
+
 def test_locked_theta_policy_prefers_feasible_then_tiebreaks_by_lower_theta(monkeypatch):
     monkeypatch.setattr(metropt_main, "parse_risk_grid_spec", lambda _spec: [0.4, 0.5, 0.6])
     monkeypatch.setattr(

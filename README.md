@@ -1,7 +1,7 @@
 ## MetroPT PdM Framework
 
 General-purpose anomaly and early-warning pipeline for the MetroPT‑3 tram maintenance dataset.  
-The project ingests raw MetroPT telemetry, engineers rolling statistical features, trains an unsupervised detector, and evaluates alarms in the context of the 21 documented maintenance windows. The goal is to inspect how well an unsupervised model can warn about failures within the configured pre-maintenance horizon, while keeping the pipeline reusable for different detector backends (e.g., Isolation Forest now, autoencoders later).
+The project ingests raw MetroPT telemetry, engineers rolling statistical features, trains an unsupervised detector, and evaluates alarms in the context of the 21 documented maintenance windows. The goal is to inspect how well an unsupervised model can warn about failures within the configured pre-maintenance horizon, while keeping the pipeline reusable for different detector backends.
 
 ### Dataset
 - `datasets/MetroPT3.csv`: 16 sensor channels (pressures, temperatures, currents, actuator states) with a timestamp column.
@@ -11,12 +11,14 @@ The project ingests raw MetroPT telemetry, engineers rolling statistical feature
 1. **Load & clean** – `data_utils.load_csv` removes “Unnamed” columns, infers the timestamp column, and sorts chronologically.
 2. **Feature selection** – `select_numeric_features` keeps all numeric sensors and orders them by domain preference when available.
 3. **Rolling aggregation** – `build_rolling_features` computes mean/median/std/skew/min/max over a configurable window (`ROLLING_WINDOW`, default `60s`) to produce the model matrix.
-4. **Detector training** – supports two regimes: a single global model (`EXPERIMENT_MODE="single"`) trained on the first `TRAIN_FRAC` minutes, or a sequence of per‑maintenance models (`"per_maint"`) trained on the initial baseline plus a short post‑maintenance interval for each cycle. The current implementation uses Isolation Forest via `detectors/iforest_detector.py`, but the pipeline is detector‑agnostic (`DETECTOR_TYPE`).
+4. **Detector training** – supports two regimes: a single global model (`EXPERIMENT_MODE="single"`) trained on the first `TRAIN_FRAC` minutes, or a sequence of per‑maintenance models (`"per_maint"`) trained on the initial baseline plus a short post‑maintenance interval for each cycle. Local single-mode detectors use `DETECTOR_TYPE` (`iforest`, `recurrent-vae`, `recurrent-sae`); imported per-maint evaluation is controlled by `PER_MAINT_USE_IMPORTED_MODELS`.
 5. **Maintenance context** – `build_operation_phase` encodes states (0 normal, 1 pre‑maintenance, 2 maintenance). `maintenance_risk` is the rolling average of extreme‑point exceedance (`risk_score >= RISK_EXCEEDANCE_QUANTILE`) over `RISK_WINDOW_MINUTES` minutes and serves as the early‑warning signal.
-6. **Risk threshold search** – `metrics_point.evaluate_risk_thresholds` tries a grid (`RISK_EVAL_GRID_SPEC`) and reports precision/recall/F1 along with TP/FP/FN counts for alarms versus maintenance windows.
+6. **Risk threshold search** – `metrics_point.evaluate_risk_thresholds` tries a grid (`RISK_EVAL_GRID_SPEC` plus strict probes from `RISK_EVAL_EXTRA_THRESHOLDS`) and reports precision/recall/F1 along with TP/FP/FN counts for alarms versus maintenance windows.
 7. **Outputs** – `datasets/metropt3_features.csv` (opt.) with the engineered rolling stats, plus unified runtime artifacts in `artifacts/<detector-group>/<mode>/`:
    - `logs/run.log`
    - `predictions/metropt3_predictions.csv` (opt.)
+   - `predictions/theta_sweep_maintenance_risk.csv`, `predictions/theta_sweep_summary.csv`
+   - `predictions/alarm_islands.csv`, `predictions/alarm_island_summary.csv`
    - `plots/metropt3_raw.png`, `plots/lead_time_distribution.png`, `plots/pr_vs_lead_time.png`
    together with console `[INFO]` model settings and `[RISK]` summaries.
 
@@ -28,7 +30,7 @@ pandas
 scikit-learn
 matplotlib
 ```
-Optional (only when using `DETECTOR_TYPE="autoencoder"`):
+Optional (only when using PyTorch recurrent detectors such as `recurrent-vae` or `recurrent-sae`, or imported recurrent artifacts):
 ```
 torch
 ```
@@ -55,15 +57,21 @@ By default `EXPERIMENT_MODE` in `main.py` is set to `"single"` (one global model
 
 Command-line arguments are not required, but you can tweak configuration constants at the top of `main.py` (paths, rolling windows, training window, maintenance windows, labelling options).
 
-### Imported NiaNetVAE per-cycle models (per_maint)
-To consume pretrained artifacts exported from `NiaNetVAE`:
-1. Set `EXPERIMENT_MODE="per_maint"`.
-2. Set `DETECTOR_TYPE="autoencoder"` (compatibility guard: imported mode is not allowed with `iforest`).
-3. Set `PER_MAINT_USE_IMPORTED_MODELS=True`.
-4. Set `PER_MAINT_MODEL_MANIFEST_PATH` to exported `cycle_manifest.json`.
-5. Keep `PER_MAINT_MODEL_STRICT=True` for production (fails fast on missing model artifacts).
+### Local recurrent SAE/VAE detectors (single)
+For local recurrent reconstruction baselines inside the current framework, set:
+1. `EXPERIMENT_MODE="single"`.
+2. `DETECTOR_TYPE="recurrent-vae"` or `DETECTOR_TYPE="recurrent-sae"`.
 
-In this mode, metropt resolves cycle models from the manifest (including alias cycles) and uses them in fixed inference mode (no model weight updates in this repository).
+Both detectors use the same combined analog+digital rolling feature matrix and a shared LSTM sequence setup: sequence length `200`, stride `1`, hidden size `64`, two recurrent layers, latent dimension `32`, Adam, learning rate `0.003`, batch size `64`, and training-split standardization. The VAE uses stochastic latent sampling with KL beta `0.1`; the SAE uses deterministic sparse latent activations with KL sparsity beta/rho defaults in `main.py`.
+
+### Imported per-cycle recurrent artifacts (per_maint)
+To consume pretrained per-cycle recurrent artifacts exported from `NiaNetVAE`:
+1. Set `EXPERIMENT_MODE="per_maint"`.
+2. Set `PER_MAINT_USE_IMPORTED_MODELS=True`.
+3. Set `PER_MAINT_MODEL_MANIFEST_PATH` to exported `cycle_manifest.json`.
+4. Keep `PER_MAINT_MODEL_STRICT=True` for production (fails fast on missing model artifacts).
+
+In this mode, metropt resolves cycle models from the manifest (including alias cycles) and uses them in fixed inference mode (no model weight updates in this repository). `DETECTOR_TYPE` is ignored for imported per-maint evaluation.
 
 #### Recommended local setup (Windows dedicated venv)
 Use a dedicated Python 3.11 virtual environment for metropt imported-mode evaluation to avoid changing your existing interpreter:
@@ -93,8 +101,9 @@ The manifest contains explicit `trained` / `alias` / `missing` cycle states; str
 ### Key Files
 - `main.py` – main workflow runner (loading → features → model → risk → plotting).
 - `data_utils.py` – CSV ingestion, feature engineering, maintenance-window parsing.
-- `detectors/` – detector backends and shared post‑processing (`iforest_detector.py`, `autoencoder_detector.py`, `postprocess.py`).
+- `detectors/` – detector backends and shared post‑processing (`iforest_detector.py`, `recurrent_autoencoder_detector.py`, `imported_recurrent_autoencoder_detector.py`, `postprocess.py`).
 - `metrics_point.py` – point‑wise and risk‑grid evaluation.
+- `metrics_alarm_islands.py` – selected-threshold alarm block diagnostics.
 - `metrics_event.py` – event‑level evaluation (TTD, FAR, FAA, MTIA, PR‑LT, etc.).
 - `plotting.py` – visualisation of risk states, lead-time distribution, and precision/recall vs lead time.
 
@@ -105,6 +114,7 @@ The manifest contains explicit `trained` / `alias` / `missing` cycle states; str
 - `predicted_phase`: 1 when `maintenance_risk >= θ` (alarm state), otherwise 0; `θ` is the best threshold from the risk grid.
 - `[METRIC]` console block: point-wise performance of `is_anomaly` when predicting pre-maintenance horizon (phase 1) vs normal operation (phase 0). Maintenance rows (phase 2) are ignored for these metrics.
 - `[RISK]` / `[RISK-PERMAINT]` console blocks: event-level performance of the rolling risk alarm (TP/FP/FN refer to maintenance events and alarm intervals, not individual rows).
+- `alarm_islands.csv`: one row per contiguous selected-threshold alarm block, including duration, point count, gap from previous block, and whether it overlaps the strict early-warning window.
 
 ### Large Files
 `datasets/MetroPT3.csv`, prediction CSVs under `artifacts/`, and generated plots/logs under `artifacts/` can grow quickly and should remain untracked (add to `.gitignore` or use Git LFS if they must be shared).

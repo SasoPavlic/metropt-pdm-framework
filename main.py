@@ -12,7 +12,6 @@ Single-series anomaly explorer (native timeline plot, MetroPT-3).
 
 from __future__ import annotations
 
-import argparse
 import json
 import random
 import time
@@ -31,13 +30,30 @@ from data_utils import (
     parse_maintenance_windows,
     select_numeric_features,
 )
+from metrics_alarm_islands import (
+    build_alarm_island_report,
+    print_alarm_island_summary,
+    save_alarm_island_report,
+)
 from metrics_event import evaluate_maintenance_prediction
 from metrics_point import confusion_and_scores, evaluate_risk_thresholds
 from detectors import get_detector
+from detectors.recurrent_autoencoder_detector import (
+    LOCAL_RECURRENT_TYPES,
+    RECURRENT_SAE_TYPE,
+    RECURRENT_VAE_TYPE,
+    build_recurrent_detector_kwargs,
+    is_local_recurrent_type,
+    is_recurrent_sae_type,
+    is_recurrent_vae_type,
+)
 from detectors.postprocess import train_and_score
 from detectors.utils import time_based_train_mask
 from plotting import plot_raw_timeline, plot_lead_time_distribution, plot_pr_vs_lead_time
 from logging_utils import log_to_file
+
+
+IMPORTED_RECURRENT_AUTOENCODER_TYPE = "imported-recurrent-autoencoder"
 
 
 def parse_risk_grid_spec(spec: str) -> List[float]:
@@ -55,6 +71,22 @@ def parse_risk_grid_spec(spec: str) -> List[float]:
         values.append(round(val, 6))
         val += step
     return values
+
+
+def build_risk_threshold_grid(
+    grid_spec: str,
+    extra_thresholds: Optional[List[float]] = None,
+) -> List[float]:
+    """Build the maintenance-risk theta grid from coarse range + explicit probes."""
+    thresholds = parse_risk_grid_spec(grid_spec)
+    for raw_value in extra_thresholds or []:
+        value = float(raw_value)
+        if not np.isfinite(value):
+            raise ValueError("Risk grid thresholds must be finite.")
+        if value < 0.0 or value > 1.0:
+            raise ValueError("Risk grid thresholds must be within [0, 1].")
+        thresholds.append(value)
+    return sorted({round(float(value), 6) for value in thresholds})
 
 
 def _set_global_seed(seed: int) -> None:
@@ -104,9 +136,24 @@ def _detector_artifact_group(detector: str) -> str:
     key = str(detector).strip().lower()
     if key in {"iforest", "isolation_forest", "isolationforest"}:
         return "iforest"
-    if key in {"autoencoder", "ae", "nianetvae", "nianetvae_pretrained"}:
-        return "vae"
+    if is_recurrent_vae_type(key):
+        return RECURRENT_VAE_TYPE
+    if is_recurrent_sae_type(key):
+        return RECURRENT_SAE_TYPE
+    if key == IMPORTED_RECURRENT_AUTOENCODER_TYPE:
+        return IMPORTED_RECURRENT_AUTOENCODER_TYPE
     return key or "unknown"
+
+
+def _detector_display_label(detector: str) -> str:
+    key = str(detector).strip().lower()
+    if is_recurrent_vae_type(key):
+        return "RecurrentVAE"
+    if is_recurrent_sae_type(key):
+        return "RecurrentSAE"
+    if key == IMPORTED_RECURRENT_AUTOENCODER_TYPE:
+        return "ImportedRecurrentAE"
+    return "IsolationForest"
 
 
 def _artifact_subdir(mode: str, detector: str, kind: str) -> Path:
@@ -208,7 +255,7 @@ def _resolve_artifact_mode(mode: str) -> str:
 def _effective_detector_type(mode: str) -> str:
     mode_norm = str(mode).strip().lower()
     if mode_norm == "per_maint" and PER_MAINT_USE_IMPORTED_MODELS:
-        return "nianetvae"
+        return IMPORTED_RECURRENT_AUTOENCODER_TYPE
     return DETECTOR_TYPE
 
 
@@ -234,58 +281,31 @@ def _validate_runtime_configuration(mode: str) -> None:
             ],
         )
 
-    known_detectors = {
-        "iforest",
-        "isolation_forest",
-        "isolationforest",
-        "autoencoder",
-        "ae",
-        "nianetvae",
-        "nianetvae_pretrained",
-    }
-    imported_compatible = {"autoencoder", "ae", "nianetvae", "nianetvae_pretrained"}
-    if detector not in known_detectors:
+    if mode_norm not in {"single", "per_maint"}:
         _config_error(
-            f"Unsupported DETECTOR_TYPE={DETECTOR_TYPE!r}.",
-            [
-                "Use one of: iforest, autoencoder.",
-                "For imported NiaNetVAE flow, use DETECTOR_TYPE='autoencoder' and PER_MAINT_USE_IMPORTED_MODELS=True.",
-            ],
+            f"Unsupported EXPERIMENT_MODE={mode!r}.",
+            ["Use EXPERIMENT_MODE='single' or EXPERIMENT_MODE='per_maint'."],
         )
 
+    local_single_detectors = {"iforest", "isolation_forest", "isolationforest"} | LOCAL_RECURRENT_TYPES
+
     if mode_norm == "single":
-        if detector in {"nianetvae", "nianetvae_pretrained"}:
+        if detector not in local_single_detectors:
             _config_error(
-                f"DETECTOR_TYPE={DETECTOR_TYPE!r} is not supported in single mode.",
+                f"Unsupported DETECTOR_TYPE={DETECTOR_TYPE!r} for EXPERIMENT_MODE='single'.",
                 [
-                    "Use DETECTOR_TYPE='iforest' or 'autoencoder' for EXPERIMENT_MODE='single'.",
-                    "If you want imported NiaNetVAE models, switch to EXPERIMENT_MODE='per_maint'.",
+                    "Use DETECTOR_TYPE='iforest', 'recurrent-vae', or 'recurrent-sae'.",
                 ],
             )
         if imported:
             print("[CONFIG-WARN] PER_MAINT_USE_IMPORTED_MODELS=True is ignored in single mode.")
         return
 
-    if mode_norm != "per_maint":
-        _config_error(
-            f"Unsupported EXPERIMENT_MODE={mode!r}.",
-            ["Use EXPERIMENT_MODE='single' or EXPERIMENT_MODE='per_maint'."],
-        )
-
     if imported:
-        if detector not in imported_compatible:
-            _config_error(
-                f"Invalid combination: EXPERIMENT_MODE='per_maint', DETECTOR_TYPE={DETECTOR_TYPE!r}, "
-                "PER_MAINT_USE_IMPORTED_MODELS=True.",
-                [
-                    "For per-maint IF training: set PER_MAINT_USE_IMPORTED_MODELS=False.",
-                    "For per-maint imported NiaNetVAE inference: set DETECTOR_TYPE='autoencoder' and keep PER_MAINT_USE_IMPORTED_MODELS=True.",
-                ],
-            )
         if not PER_MAINT_MODEL_MANIFEST_PATH:
             _config_error(
                 "PER_MAINT_MODEL_MANIFEST_PATH is required when PER_MAINT_USE_IMPORTED_MODELS=True.",
-                ["Set PER_MAINT_MODEL_MANIFEST_PATH to cycle_manifest.json exported from NiaNetVAE."],
+                ["Set PER_MAINT_MODEL_MANIFEST_PATH to cycle_manifest.json exported by NiaNetVAE."],
             )
         manifest_path = Path(str(PER_MAINT_MODEL_MANIFEST_PATH)).expanduser()
         if not manifest_path.exists():
@@ -293,15 +313,17 @@ def _validate_runtime_configuration(mode: str) -> None:
                 f"Manifest path does not exist: {manifest_path}",
                 ["Verify path and that cycle artifacts + cycle_manifest.json were copied locally."],
             )
-    else:
-        if detector in {"nianetvae", "nianetvae_pretrained"}:
-            _config_error(
-                f"DETECTOR_TYPE={DETECTOR_TYPE!r} requires PER_MAINT_USE_IMPORTED_MODELS=True.",
-                [
-                    "Set PER_MAINT_USE_IMPORTED_MODELS=True and provide PER_MAINT_MODEL_MANIFEST_PATH.",
-                    "Or switch DETECTOR_TYPE to 'iforest'/'autoencoder' for local training.",
-                ],
-            )
+        return
+
+    local_per_maint_detectors = {"iforest", "isolation_forest", "isolationforest"}
+    if detector not in local_per_maint_detectors:
+        _config_error(
+            f"Unsupported DETECTOR_TYPE={DETECTOR_TYPE!r} for local per-maint training.",
+            [
+                "Use DETECTOR_TYPE='iforest' with PER_MAINT_USE_IMPORTED_MODELS=False.",
+                "Set PER_MAINT_USE_IMPORTED_MODELS=True to evaluate imported per-cycle recurrent artifacts.",
+            ],
+        )
 
 
 
@@ -368,76 +390,58 @@ PER_MAINT_USE_IMPORTED_MODELS: bool = True
 PER_MAINT_MODEL_MANIFEST_PATH: Optional[str] = r'C:\Users\sasop\CodexProjects\nianet\NiaNetVAE\logs\per_maint_models_finetune_smoothed_rankgap\MetroPT\cycle_manifest.json'
 PER_MAINT_MODEL_STRICT: bool = True
 
-# Detector backend ("iforest" now, "autoencoder" later)
-DETECTOR_TYPE: str = "autoencoder"
+# Detector backend for local training ("iforest", "recurrent-vae", "recurrent-sae")
+DETECTOR_TYPE: str = "iforest"
 GLOBAL_SEED: int = 42
 
-# Autoencoder / VAE settings (used when DETECTOR_TYPE="autoencoder")
-AE_SEQUENCE_LEN: int = 200
-AE_STRIDE: int = 1
-AE_SCORE_STRIDE: int = 1
-AE_RNN_TYPE: str = "LSTM"
-AE_HIDDEN_SIZE: int = 8
-AE_NUM_LAYERS: int = 2
-AE_BIDIRECTIONAL: bool = False
-AE_LATENT_DIM: Optional[int] = 48  # defaults to features // 2 (n_features = (# numeric sensors) * 6 = 96 features
-AE_BETA: float = 0.1
-AE_EPOCHS: int = 15
-AE_BATCH_SIZE: int = 64
-AE_NUM_WORKERS: int = 1
-AE_PIN_MEMORY: bool = True
-AE_PERSISTENT_WORKERS: bool = True
-AE_LR: float = 0.003
-AE_WEIGHT_DECAY: float = 0.0
-AE_DEVICE: str = "cuda"
-AE_MODEL_PATH: Optional[str] = None  # set to load a pretrained AE/VAE
-AE_LOAD_PRETRAINED: bool = True
+# Recurrent SAE/VAE settings (used when DETECTOR_TYPE is recurrent-vae/recurrent-sae)
+REC_SEQUENCE_LEN: int = 200
+REC_STRIDE: int = 1
+REC_SCORE_STRIDE: int = 1
+REC_HIDDEN_SIZE: int = 64
+REC_NUM_LAYERS: int = 2
+REC_LATENT_DIM: int = 32
+REC_EPOCHS: int = 30
+REC_BATCH_SIZE: int = 64
+REC_NUM_WORKERS: int = 1
+REC_PIN_MEMORY: bool = True
+REC_PERSISTENT_WORKERS: bool = True
+REC_LR: float = 0.003
+REC_WEIGHT_DECAY: float = 1e-5
+REC_DEVICE: str = "cuda"
+REC_VAE_KL_BETA: float = 0.1
+REC_SAE_SPARSITY_BETA: float = 0.05
+REC_SAE_SPARSITY_RHO: float = 0.05
 
 # Detector hyperparameters
-DETECTOR_KWARGS = {"random_state": 42}
-if DETECTOR_TYPE == "autoencoder":
-    from detectors.vae_models import build_recurrent_vae
-
-    def _vae_factory(
-        input_dim: int,
-        seq_len: int = AE_SEQUENCE_LEN,
-        rnn_type: str = AE_RNN_TYPE,
-        hidden_size: int = AE_HIDDEN_SIZE,
-        num_layers: int = AE_NUM_LAYERS,
-        latent_dim: int = 1,
-        bidirectional: bool = AE_BIDIRECTIONAL,
-    ):
-        return build_recurrent_vae(
-            input_dim=input_dim,
-            seq_len=seq_len,
-            rnn_type=rnn_type,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            latent_dim=latent_dim,
-            bidirectional=bidirectional,
-        )
-
+RECURRENT_DETECTOR_KWARGS = build_recurrent_detector_kwargs(
+    sequence_len=REC_SEQUENCE_LEN,
+    stride=REC_STRIDE,
+    score_stride=REC_SCORE_STRIDE,
+    hidden_size=REC_HIDDEN_SIZE,
+    num_layers=REC_NUM_LAYERS,
+    latent_dim=REC_LATENT_DIM,
+    epochs=REC_EPOCHS,
+    batch_size=REC_BATCH_SIZE,
+    lr=REC_LR,
+    weight_decay=REC_WEIGHT_DECAY,
+    device=REC_DEVICE,
+    num_workers=REC_NUM_WORKERS,
+    persistent_workers=REC_PERSISTENT_WORKERS,
+    pin_memory=REC_PIN_MEMORY,
+    random_state=GLOBAL_SEED,
+)
+DETECTOR_KWARGS = {"random_state": GLOBAL_SEED}
+if is_recurrent_vae_type(DETECTOR_TYPE):
     DETECTOR_KWARGS = {
-        "model_factory": _vae_factory,
-        "epochs": AE_EPOCHS,
-        "batch_size": AE_BATCH_SIZE,
-        "lr": AE_LR,
-        "weight_decay": AE_WEIGHT_DECAY,
-        "device": AE_DEVICE,
-        "sequence_len": AE_SEQUENCE_LEN,
-        "stride": AE_STRIDE,
-        "score_stride": AE_SCORE_STRIDE,
-        "beta": AE_BETA,
-        "rnn_type": AE_RNN_TYPE,
-        "hidden_size": AE_HIDDEN_SIZE,
-        "num_layers": AE_NUM_LAYERS,
-        "latent_dim": AE_LATENT_DIM,
-        "bidirectional": AE_BIDIRECTIONAL,
-        "model_path": AE_MODEL_PATH,
-        "load_pretrained": AE_LOAD_PRETRAINED,
-        "num_workers": AE_NUM_WORKERS,
-        "persistent_workers": AE_PERSISTENT_WORKERS,
-        "pin_memory": AE_PIN_MEMORY,
+        **RECURRENT_DETECTOR_KWARGS,
+        "kl_beta": REC_VAE_KL_BETA,
+    }
+elif is_recurrent_sae_type(DETECTOR_TYPE):
+    DETECTOR_KWARGS = {
+        **RECURRENT_DETECTOR_KWARGS,
+        "sparsity_beta": REC_SAE_SPARSITY_BETA,
+        "sparsity_rho": REC_SAE_SPARSITY_RHO,
     }
 
 
@@ -448,11 +452,13 @@ ROLLING_WINDOW: str = "60s"
 TRAIN_FRAC: float = 1440
 # --- Modeling / scoring ---
 # Rolling risk window (minutes).
-RISK_WINDOW_MINUTES: int = 480
+RISK_WINDOW_MINUTES: int = 120
 # Quantile for extreme-point exceedance when building maintenance risk.
-RISK_EXCEEDANCE_QUANTILE: float = 0.90
+RISK_EXCEEDANCE_QUANTILE: float = 0.99
 # Risk evaluation grid specification (start:stop:step).
 RISK_EVAL_GRID_SPEC: str = "0.10:0.90:0.05"
+# Extra strict theta probes for diagnosing high alarm coverage.
+RISK_EVAL_EXTRA_THRESHOLDS: List[float] = [0.925, 0.95, 0.975, 0.985, 0.99, 0.995]
 # Locked deterministic theta-selection policy (S1-T4).
 THRESHOLD_POLICY_FIXED_LEAD_MINUTES: int = 120
 THRESHOLD_POLICY_TARGET_RECALL: float = 0.60
@@ -785,7 +791,10 @@ def _evaluate_risk_series(
     best_stats: Optional[dict] = None
 
     try:
-        risk_thresholds = parse_risk_grid_spec(RISK_EVAL_GRID_SPEC)
+        risk_thresholds = build_risk_threshold_grid(
+            RISK_EVAL_GRID_SPEC,
+            RISK_EVAL_EXTRA_THRESHOLDS,
+        )
     except ValueError as exc:
         print(f"[WARN] Skipping maintenance_risk evaluation: {exc}")
 
@@ -1171,6 +1180,29 @@ def _save_maintenance_risk_theta_sweep(
     _print_theta_sweep_summary(summary)
 
 
+def _save_alarm_island_analysis(
+    predictions: pd.Series,
+    maint_windows: List[Tuple],
+    eval_mask: pd.Series,
+    *,
+    mode: str,
+    detector: str,
+    label: str,
+) -> dict:
+    islands, summary = build_alarm_island_report(
+        predictions=predictions,
+        maintenance_windows=maint_windows,
+        early_warning_minutes=THRESHOLD_POLICY_FIXED_LEAD_MINUTES,
+        eval_mask=eval_mask,
+    )
+    islands_path = _pred_output_path("alarm_islands.csv", mode, detector)
+    summary_path = _pred_output_path("alarm_island_summary.csv", mode, detector)
+    if islands_path and summary_path:
+        save_alarm_island_report(islands, summary, islands_path, summary_path)
+    print_alarm_island_summary(label, summary)
+    return summary
+
+
 def _print_event_extra_metrics(label: str, event_results: dict) -> None:
     _print_section(f"ADDITIONAL EVENT METRICS ({label})")
     ttd = event_results.get("ttd", {})
@@ -1363,6 +1395,14 @@ def _run_single_model_experiment(
         mode="single",
         detector=DETECTOR_TYPE,
     )
+    info["alarm_island_summary"] = _save_alarm_island_analysis(
+        predictions=pred["predicted_phase"],
+        maint_windows=maint_windows,
+        eval_mask=eval_mask,
+        mode="single",
+        detector=DETECTOR_TYPE,
+        label="Single",
+    )
     _print_event_extra_metrics("Single", event_results)
     _save_event_plots(event_results, mode="single", detector=DETECTOR_TYPE)
 
@@ -1433,7 +1473,6 @@ def _run_per_maintenance_experiment(
 
     period_infos: List[dict] = []
 
-    data_start = index.min()
     data_end = index.max()
     first_start = starts[0]
     pre_w1_test_mask = (index < first_start) & (~initial_train_order_mask)
@@ -1450,20 +1489,20 @@ def _run_per_maintenance_experiment(
                 "PER_MAINT_USE_IMPORTED_MODELS=True requires PER_MAINT_MODEL_MANIFEST_PATH."
             )
         manifest_payload, manifest_dir = _load_cycle_manifest(PER_MAINT_MODEL_MANIFEST_PATH)
-        detector_type_runtime = "nianetvae"
+        detector_type_runtime = IMPORTED_RECURRENT_AUTOENCODER_TYPE
         detector_kwargs_runtime = {
-            "device": AE_DEVICE,
+            "device": REC_DEVICE,
             "use_scaler": True,
-            "batch_size": AE_BATCH_SIZE,
-            "sequence_len": AE_SEQUENCE_LEN,
-            "stride": AE_STRIDE,
-            "score_stride": AE_SCORE_STRIDE,
-            "num_workers": AE_NUM_WORKERS,
-            "persistent_workers": AE_PERSISTENT_WORKERS,
-            "pin_memory": AE_PIN_MEMORY,
+            "batch_size": REC_BATCH_SIZE,
+            "sequence_len": REC_SEQUENCE_LEN,
+            "stride": REC_STRIDE,
+            "score_stride": REC_SCORE_STRIDE,
+            "num_workers": REC_NUM_WORKERS,
+            "persistent_workers": REC_PERSISTENT_WORKERS,
+            "pin_memory": REC_PIN_MEMORY,
         }
         print(
-            f"[INFO] Per-maint imported-model mode enabled. "
+            f"[INFO] Per-maint imported recurrent artifact mode enabled. "
             f"Manifest={Path(PER_MAINT_MODEL_MANIFEST_PATH).resolve()}"
         )
 
@@ -1578,7 +1617,7 @@ def _run_per_maintenance_experiment(
 
         detector = get_detector(detector_type_runtime, **detector_kwargs)
         t_seg = None
-        if detector_type_runtime in {"autoencoder", "ae", "nianetvae", "nianetvae_pretrained"}:
+        if detector_type_runtime == IMPORTED_RECURRENT_AUTOENCODER_TYPE or is_local_recurrent_type(detector_type_runtime):
             run_label = "Infer segment" if use_imported_models else "Run segment"
             t_seg = _log_step_start(
                 f"{run_label} {seg_label} (train={X_train.shape[0]}, test={X_test.shape[0]})"
@@ -1752,6 +1791,14 @@ def _run_per_maintenance_experiment(
         mode="per_maint",
         detector=detector_type_runtime,
     )
+    alarm_island_summary = _save_alarm_island_analysis(
+        predictions=pred["predicted_phase"],
+        maint_windows=mw_sorted,
+        eval_mask=eval_mask,
+        mode="per_maint",
+        detector=detector_type_runtime,
+        label="Per-maint",
+    )
     _print_event_extra_metrics("Per-maint", event_results)
     _save_event_plots(event_results, mode="per_maint", detector=detector_type_runtime)
 
@@ -1773,6 +1820,7 @@ def _run_per_maintenance_experiment(
     }
     summary_info["event_metrics"] = event_results
     summary_info["threshold_policy"] = threshold_policy_report
+    summary_info["alarm_island_summary"] = alarm_island_summary
     return pred, summary_info, best_risk_threshold, predicted_phase
 
 
@@ -1820,12 +1868,7 @@ def main() -> None:
 
     effective_show_labels = bool(SHOW_WINDOW_LABELS or USE_DEFAULT_METROPT_WINDOWS)
     save_fig_path = _output_path_with_detector(SAVE_FIG_PATH, mode, effective_detector)
-    if effective_detector in {"autoencoder", "ae"}:
-        detector_label = "VAE"
-    elif effective_detector in {"nianetvae", "nianetvae_pretrained"}:
-        detector_label = "NiaNetVAE"
-    else:
-        detector_label = "IsolationForest"
+    detector_label = _detector_display_label(effective_detector)
     plot_raw_timeline(
         df_plot,
         maint_windows,

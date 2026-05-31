@@ -38,6 +38,7 @@ from metrics_alarm_islands import (
 from metrics_event import evaluate_maintenance_prediction
 from metrics_point import confusion_and_scores, evaluate_risk_thresholds
 from detectors import get_detector
+from detectors.imported_recurrent_autoencoder_detector import ARTIFACT_CONTRACT_VERSION
 from detectors.recurrent_autoencoder_detector import (
     LOCAL_RECURRENT_TYPES,
     RECURRENT_SAE_TYPE,
@@ -313,6 +314,7 @@ def _validate_runtime_configuration(mode: str) -> None:
                 f"Manifest path does not exist: {manifest_path}",
                 ["Verify path and that cycle artifacts + cycle_manifest.json were copied locally."],
             )
+        _load_cycle_manifest(str(manifest_path))
         return
 
     local_per_maint_detectors = {"iforest", "isolation_forest", "isolationforest"}
@@ -387,11 +389,11 @@ EXPERIMENT_MODE: str = "per_maint"
 
 # Pretrained per-maint model handoff (manifest-driven)
 PER_MAINT_USE_IMPORTED_MODELS: bool = True
-PER_MAINT_MODEL_MANIFEST_PATH: Optional[str] = r'C:\Users\sasop\CodexProjects\nianet\NiaNetVAE\logs\per_maint_models_finetune_smoothed_rankgap\MetroPT\cycle_manifest.json'
+PER_MAINT_MODEL_MANIFEST_PATH: Optional[str] = r'C:\Users\sasop\CodexProjects\nianet\NiaNetVAE\logs\per_maint_vae_finetune\MetroPT\cycle_manifest.json'
 PER_MAINT_MODEL_STRICT: bool = True
 
 # Detector backend for local training ("iforest", "recurrent-vae", "recurrent-sae")
-DETECTOR_TYPE: str = "iforest"
+DETECTOR_TYPE: str = "recurrent-vae"
 GLOBAL_SEED: int = 42
 
 # Recurrent SAE/VAE settings (used when DETECTOR_TYPE is recurrent-vae/recurrent-sae)
@@ -409,7 +411,7 @@ REC_PERSISTENT_WORKERS: bool = True
 REC_LR: float = 0.003
 REC_WEIGHT_DECAY: float = 1e-5
 REC_DEVICE: str = "cuda"
-REC_VAE_KL_BETA: float = 0.1
+REC_VAE_KL_BETA: float = 0.001
 REC_SAE_SPARSITY_BETA: float = 0.05
 REC_SAE_SPARSITY_RHO: float = 0.05
 
@@ -449,12 +451,12 @@ elif is_recurrent_sae_type(DETECTOR_TYPE):
 # Rolling window for feature aggregation (e.g., '600s' = 10 minutes).
 ROLLING_WINDOW: str = "60s"
 # Duration (minutes) of the initial training window (chronological from the start).
-TRAIN_FRAC: float = 1440
+TRAIN_FRAC: float = 43200
 # --- Modeling / scoring ---
 # Rolling risk window (minutes).
 RISK_WINDOW_MINUTES: int = 120
 # Quantile for extreme-point exceedance when building maintenance risk.
-RISK_EXCEEDANCE_QUANTILE: float = 0.99
+RISK_EXCEEDANCE_QUANTILE: float = 0.95
 # Risk evaluation grid specification (start:stop:step).
 RISK_EVAL_GRID_SPEC: str = "0.10:0.90:0.05"
 # Extra strict theta probes for diagnosing high alarm coverage.
@@ -472,7 +474,7 @@ LEAD_STEP_MINUTES: int = 30
 # clipped so it does not intrude into the next maintenance window. The same
 # time mask is excluded from point-wise evaluation in the single-model regime
 # for fair comparison.
-POST_MAINT_TRAIN_MINUTES: int = 1440
+POST_MAINT_TRAIN_MINUTES: int = 540
 
 # --- Maintenance context / plotting ---
 # Minutes before maintenance start considered pre-maintenance (operation_phase=1)
@@ -667,6 +669,23 @@ def _ensure_bool_mask(mask: object, index: pd.Index) -> pd.Series:
     return out.astype(bool)
 
 
+def _dataframe_segments_from_mask(X: pd.DataFrame, mask: pd.Series) -> List[pd.DataFrame]:
+    """Return contiguous dataframe segments for True-runs in a full-index mask."""
+    aligned_mask = _ensure_bool_mask(mask, X.index)
+    flags = aligned_mask.to_numpy(dtype=bool)
+    segments: List[pd.DataFrame] = []
+    start: Optional[int] = None
+    for pos, flag in enumerate(flags):
+        if flag and start is None:
+            start = pos
+        elif not flag and start is not None:
+            segments.append(X.iloc[start:pos])
+            start = None
+    if start is not None:
+        segments.append(X.iloc[start:])
+    return [segment for segment in segments if not segment.empty]
+
+
 def _cycle_key(cycle_id: int) -> str:
     return f"{int(cycle_id):02d}"
 
@@ -676,8 +695,40 @@ def _load_cycle_manifest(path: str) -> tuple[dict, Path]:
     if not p.exists():
         raise FileNotFoundError(f"PER_MAINT_MODEL_MANIFEST_PATH not found: {p}")
     payload = json.loads(p.read_text(encoding="utf-8"))
+    if str(payload.get("schema_version")) != ARTIFACT_CONTRACT_VERSION:
+        raise ValueError(
+            "Imported cycle_manifest.json must use contract v2 "
+            f"(schema_version={ARTIFACT_CONTRACT_VERSION!r}); "
+            f"got schema_version={payload.get('schema_version')!r}."
+        )
+    if str(payload.get("contract_version")) != ARTIFACT_CONTRACT_VERSION:
+        raise ValueError(
+            "Imported cycle_manifest.json must declare "
+            f"contract_version={ARTIFACT_CONTRACT_VERSION!r}; "
+            f"got contract_version={payload.get('contract_version')!r}."
+        )
     if "cycles" not in payload or not isinstance(payload["cycles"], dict):
         raise ValueError(f"Invalid cycle manifest format at {p}: missing 'cycles' object.")
+    for key, entry in payload["cycles"].items():
+        if not isinstance(entry, dict):
+            raise ValueError(f"Invalid cycle manifest format at {p}: cycle {key} entry is not an object.")
+        status = str(entry.get("status", "")).strip().lower()
+        if status == "trained":
+            if str(entry.get("contract_version")) != ARTIFACT_CONTRACT_VERSION:
+                raise ValueError(
+                    f"Cycle {key} must use contract_version={ARTIFACT_CONTRACT_VERSION!r}; "
+                    f"got {entry.get('contract_version')!r}."
+                )
+            missing = [field for field in ("model_path", "meta_path", "scaler_path") if not entry.get(field)]
+            if missing:
+                raise ValueError(
+                    f"Cycle {key} status=trained is missing required v2 fields: {', '.join(missing)}."
+                )
+        elif status == "alias":
+            if entry.get("alias_to") is None:
+                raise ValueError(f"Cycle {key} status=alias is missing alias_to.")
+        elif status != "missing":
+            raise ValueError(f"Cycle {key} has unsupported status={status!r}.")
     return payload, p.parent
 
 
@@ -739,24 +790,28 @@ def _resolve_manifest_cycle(
     if status == "trained":
         model_path = _resolve_manifest_path(entry.get("model_path"), manifest_dir, cycle_id=int(cycle_id))
         meta_path = _resolve_manifest_path(entry.get("meta_path"), manifest_dir, cycle_id=int(cycle_id))
-        if not model_path or not meta_path:
+        scaler_path = _resolve_manifest_path(entry.get("scaler_path"), manifest_dir, cycle_id=int(cycle_id))
+        if not model_path or not meta_path or not scaler_path:
             if strict:
-                raise ValueError(f"Cycle {key} is trained but model_path/meta_path are missing.")
+                raise ValueError(f"Cycle {key} is trained but model_path/meta_path/scaler_path are missing.")
             return None
         model_exists = Path(model_path).exists()
         meta_exists = Path(meta_path).exists()
-        if strict and (not model_exists or not meta_exists):
+        scaler_exists = Path(scaler_path).exists()
+        if strict and (not model_exists or not meta_exists or not scaler_exists):
             raise FileNotFoundError(
                 f"Cycle {key} paths do not exist after resolution: "
                 f"model_path={model_path} (exists={model_exists}), "
-                f"meta_path={meta_path} (exists={meta_exists})"
+                f"meta_path={meta_path} (exists={meta_exists}), "
+                f"scaler_path={scaler_path} (exists={scaler_exists})"
             )
-        if not strict and (not model_exists or not meta_exists):
+        if not strict and (not model_exists or not meta_exists or not scaler_exists):
             return None
         resolved = dict(entry)
         resolved["resolved_cycle_id"] = int(entry.get("cycle_id", int(cycle_id)))
         resolved["model_path"] = model_path
         resolved["meta_path"] = meta_path
+        resolved["scaler_path"] = scaler_path
         return resolved
 
     if status == "alias":
@@ -776,6 +831,23 @@ def _resolve_manifest_cycle(
     if strict:
         raise ValueError(f"Cycle {key} unavailable in manifest (status={status!r}).")
     return None
+
+
+def _build_imported_expected_contract(cycle_id: int) -> Dict[str, object]:
+    """Runtime constants that must match NiaNetVAE v2 artifact metadata."""
+    return {
+        "rolling_window": ROLLING_WINDOW,
+        "seq_len": REC_SEQUENCE_LEN,
+        "score_stride": REC_SCORE_STRIDE,
+        "train_minutes": TRAIN_FRAC,
+        "post_train_minutes": POST_MAINT_TRAIN_MINUTES,
+        "pre_maint_minutes": PRE_MAINTENANCE_MINUTES,
+        "train_phases": [0, 1],
+        "test_phases": [0, 1],
+        "phase_policy": "end_anchor_phase",
+        "regime": "per_maint",
+        "cycle_id": int(cycle_id),
+    }
 
 
 def _evaluate_risk_series(
@@ -1609,7 +1681,9 @@ def _run_per_maintenance_experiment(
                 return None
             detector_kwargs["model_meta_path"] = resolved_entry["meta_path"]
             detector_kwargs["model_path"] = resolved_entry["model_path"]
+            detector_kwargs["scaler_path"] = resolved_entry["scaler_path"]
             resolved_cycle_id = int(resolved_entry.get("resolved_cycle_id", requested_cycle_id))
+            detector_kwargs["expected_contract"] = _build_imported_expected_contract(resolved_cycle_id)
             print(
                 f"[INFO] Imported model: segment={seg_label} requested_cycle={requested_cycle_id} "
                 f"resolved_cycle={resolved_cycle_id}"
@@ -1622,7 +1696,13 @@ def _run_per_maintenance_experiment(
             t_seg = _log_step_start(
                 f"{run_label} {seg_label} (train={X_train.shape[0]}, test={X_test.shape[0]})"
             )
-        slice_pred, info = train_and_score(detector, X_train, X_test)
+        train_score_segments = _dataframe_segments_from_mask(X, train_mask) if use_imported_models else None
+        slice_pred, info = train_and_score(
+            detector,
+            X_train,
+            X_test,
+            train_score_segments=train_score_segments,
+        )
         if t_seg is not None:
             run_label = "Infer segment" if use_imported_models else "Run segment"
             _log_step_end(f"{run_label} {seg_label}", t_seg)

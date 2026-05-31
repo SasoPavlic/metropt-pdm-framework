@@ -264,9 +264,11 @@ def test_theta_sweep_export_writes_summary_and_preserves_raw_sweep(monkeypatch, 
 def test_resolve_manifest_cycle_trained_and_alias(tmp_path: Path):
     model_file = tmp_path / "cycle_01" / "model.pt"
     meta_file = tmp_path / "cycle_01" / "model_meta.json"
+    scaler_file = tmp_path / "cycle_01" / "scaler.joblib"
     model_file.parent.mkdir(parents=True, exist_ok=True)
     model_file.write_text("x", encoding="utf-8")
     meta_file.write_text("{}", encoding="utf-8")
+    scaler_file.write_text("x", encoding="utf-8")
 
     manifest = {
         "cycles": {
@@ -275,6 +277,7 @@ def test_resolve_manifest_cycle_trained_and_alias(tmp_path: Path):
                 "cycle_id": 1,
                 "model_path": str(model_file),
                 "meta_path": str(meta_file),
+                "scaler_path": str(scaler_file),
             },
             "02": {
                 "status": "alias",
@@ -302,3 +305,4 @@ def test_resolve_manifest_cycle_trained_and_alias(tmp_path: Path):
     assert resolved_alias["resolved_cycle_id"] == 1
     assert Path(resolved_alias["model_path"]).exists()
     assert Path(resolved_alias["meta_path"]).exists()
+    assert Path(resolved_alias["scaler_path"]).exists()

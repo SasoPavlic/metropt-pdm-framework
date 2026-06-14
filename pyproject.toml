@@ -56,3 +56,4 @@ autoinstall-torch-cuda = ["install-ltt", "run-ltt"]
 [tool.poetry.scripts]
 metropt-pdm = "pdm_eval.cli:main"
 metropt-plot-schedule = "pdm_eval.tools.plot_per_maint_schedule:main"
+metropt-drift = "pdm_eval.tools.analyze_metropt_drift:main"

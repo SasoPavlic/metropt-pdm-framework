@@ -102,6 +102,18 @@ Then in PyCharm:
 
 The manifest contains explicit `trained` / `alias` / `missing` cycle states; strict mode requires all needed cycles to resolve.
 
+### Drift / non-stationarity analysis
+To generate CPU-only evidence of MetroPT target-event cycle drift, run:
+```bash
+python -m pdm_eval.tools.analyze_metropt_drift --input datasets/MetroPT3.csv --output-root artifacts/analysis/drift
+```
+or, when installed through Poetry:
+```bash
+metropt-drift --input datasets/MetroPT3.csv --output-root artifacts/analysis/drift
+```
+
+This standalone analysis uses the same rolling feature matrix as the detectors, groups rows by target maintenance event cycles, computes median feature-wise Wasserstein distances using a CPU-friendly quantile-grid estimate, and writes CSV tables plus a heatmap/PCA plot under `artifacts/analysis/drift/`. It is dataset drift evidence for the paper methodology, not a detector benchmark and not a replacement for event-level alarm evaluation.
+
 ### Key Files
 - `main.py` – thin root runner for the package CLI.
 - `metropt_pdm_framework/pipeline.py` – main workflow runner (loading → features → model → risk → plotting).

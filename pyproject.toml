@@ -4,7 +4,7 @@ version = "0.1.0"
 description = ""
 authors = ["Sašo Pavlič <saso.pavlic3@gmail.com>"]
 readme = "README.md"
-packages = [{include = "metropt_pdm_framework"}]
+packages = [{include = "pdm_eval"}]
 
 [tool.poetry.dependencies]
 python = ">=3.10,<3.12"
@@ -52,3 +52,7 @@ build-backend = "poetry.core.masonry.api"
 install-ltt = "python -m pip install light-the-torch"
 run-ltt = "python -m light_the_torch install --upgrade torch torchaudio torchvision"
 autoinstall-torch-cuda = ["install-ltt", "run-ltt"]
+
+[tool.poetry.scripts]
+metropt-pdm = "pdm_eval.cli:main"
+metropt-plot-schedule = "pdm_eval.tools.plot_per_maint_schedule:main"

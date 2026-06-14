@@ -259,7 +259,7 @@ class _BaseRecurrentDetector(BaseDetector):
         import torch
         from torch.utils.data import DataLoader
 
-        from dataloaders.metropt_dataloader import MetroPTSequenceDataset
+        from pdm_eval.dataloaders.metropt_dataloader import MetroPTSequenceDataset
 
         dataset = MetroPTSequenceDataset(
             data=X_vals,

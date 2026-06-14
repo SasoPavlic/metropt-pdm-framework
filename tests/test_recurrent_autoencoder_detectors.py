@@ -7,18 +7,18 @@ import pandas as pd
 import pytest
 from sklearn.preprocessing import StandardScaler
 
-import main as metropt_main
-import detectors.imported_recurrent_autoencoder_detector as imported_detector_module
-from detectors import (
+from pdm_eval import pipeline as metropt_main
+import pdm_eval.detectors.imported_recurrent_autoencoder_detector as imported_detector_module
+from pdm_eval.detectors import (
     RecurrentSAEDetector,
     RecurrentVAEDetector,
     get_detector,
 )
-from detectors.imported_recurrent_autoencoder_detector import (
+from pdm_eval.detectors.imported_recurrent_autoencoder_detector import (
     ImportedArtifactContractError,
     ImportedRecurrentAutoencoderDetector,
 )
-from detectors.postprocess import train_and_score
+from pdm_eval.detectors.postprocess import train_and_score
 
 
 def _synthetic_frame(rows: int = 16, cols: int = 6) -> pd.DataFrame:

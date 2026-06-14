@@ -9,12 +9,14 @@
 - Optionally consumes per-cycle exported artifacts + manifest from `NiaNetVAE`.
 
 ## Main Entry Points
-- `main.py`: orchestration, mode selection, manifest resolution, evaluation, outputs.
-- `data_utils.py`: CSV load, timestamp handling, rolling feature engineering, maintenance phase labels.
-- `detectors/`: backend implementations and factory (`get_detector`).
-- `metrics_point.py`: point-wise confusion + risk-threshold grid scoring.
-- `metrics_event.py`: event-level maintenance metrics (TTD/FAR/FAA/MTIA/PR-vs-lead/NAB).
-- `plotting.py`: risk timeline and event summary plots.
+- `main.py`: thin root runner for `metropt_pdm_framework.cli`.
+- `metropt_pdm_framework/pipeline.py`: orchestration, mode selection, manifest resolution, evaluation, outputs.
+- `metropt_pdm_framework/manifest.py`: imported NiaNetVAE cycle manifest validation and cycle artifact resolution.
+- `metropt_pdm_framework/data/preprocessing.py`: CSV load, timestamp handling, rolling feature engineering, maintenance phase labels.
+- `metropt_pdm_framework/detectors/`: backend implementations and factory (`get_detector`).
+- `metropt_pdm_framework/metrics/point.py`: point-wise confusion + risk-threshold grid scoring.
+- `metropt_pdm_framework/metrics/event.py`: event-level maintenance metrics (TTD/FAR/FAA/MTIA/PR-vs-lead/NAB).
+- `metropt_pdm_framework/visualization/plots.py`: risk timeline and event summary plots.
 
 ## Pipeline Stages (Keep Stable)
 1. Load + clean telemetry (`load_csv`).
@@ -44,7 +46,7 @@
 - Do not add workaround hacks for manifest/model mismatches; fix and document the true contract issue (and coordinate with `NiaNetVAE` when required).
 
 ## Detector / Metric Extension Guidelines
-- New detector backends must implement `BaseDetector.fit()` and `BaseDetector.score()` and be registered in `detectors/__init__.py`.
+- New detector backends must implement `BaseDetector.fit()` and `BaseDetector.score()` and be registered in `metropt_pdm_framework/detectors/__init__.py`.
 - Keep anomaly score contract: higher score means more anomalous.
 - Preserve `train_and_score` postprocessing contract unless explicitly migrating all call sites.
 - Add new metrics in dedicated metric modules and keep existing outputs backward compatible.
@@ -73,6 +75,6 @@ Run from repository root:
 - Keep source dataset immutable during implementation tasks.
 
 ## Explicit Assumptions
-- Assumption: `main.py` constants are the active configuration mechanism (no separate runtime config file currently in use).
+- Assumption: `metropt_pdm_framework/pipeline.py` constants are the active configuration mechanism (no separate runtime config file currently in use).
 - Assumption: imported `NiaNetVAE` artifacts follow current `model_meta.json` + `model.pt` + manifest schema used by resolver.
 - Assumption: MetroPT maintenance windows and pre-maintenance horizon definitions are the evaluation ground truth unless a task explicitly redefines them.

@@ -1,6 +1,6 @@
 import pandas as pd
 
-from metrics_event import calculate_first_alarm_accuracy
+from pdm_eval.metrics.event import calculate_first_alarm_accuracy
 
 
 def test_faa_penalizes_too_early_alarm_start():

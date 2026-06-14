@@ -1,7 +1,7 @@
 import pandas as pd
 import pytest
 
-from metrics_alarm_islands import build_alarm_island_report
+from pdm_eval.metrics.alarm_islands import build_alarm_island_report
 
 
 def test_alarm_island_report_classifies_and_summarizes_blocks():

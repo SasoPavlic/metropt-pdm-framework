@@ -3,8 +3,8 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-import main as metropt_main
-from metrics_point import evaluate_risk_thresholds
+from pdm_eval import pipeline as metropt_main
+from pdm_eval.metrics.point import evaluate_risk_thresholds
 
 
 def test_evaluate_risk_thresholds_respects_eval_mask_for_coverage():
@@ -145,6 +145,13 @@ def test_theta_sweep_summary_statistics_and_metric_directions():
             "far_per_week": 5.0,
             "faa": 0.2,
             "nab_standard": 10.0,
+            "ttd_mean_min": 20.0,
+            "ttd_std_min": 4.0,
+            "ttd_detected_events": 2,
+            "ttd_missed_events": 8,
+            "mtia_mean_min": 60.0,
+            "far_fp_intervals": 10,
+            "nab_low_fp": 8.0,
             "target_gap": 0.40,
         },
         {
@@ -159,6 +166,13 @@ def test_theta_sweep_summary_statistics_and_metric_directions():
             "far_per_week": 3.0,
             "faa": 0.4,
             "nab_standard": 20.0,
+            "ttd_mean_min": 40.0,
+            "ttd_std_min": 2.0,
+            "ttd_detected_events": 4,
+            "ttd_missed_events": 6,
+            "mtia_mean_min": 40.0,
+            "far_fp_intervals": 6,
+            "nab_low_fp": 18.0,
             "target_gap": 0.20,
         },
         {
@@ -173,6 +187,13 @@ def test_theta_sweep_summary_statistics_and_metric_directions():
             "far_per_week": 1.0,
             "faa": 0.1,
             "nab_standard": 15.0,
+            "ttd_mean_min": 30.0,
+            "ttd_std_min": 1.0,
+            "ttd_detected_events": 3,
+            "ttd_missed_events": 7,
+            "mtia_mean_min": 20.0,
+            "far_fp_intervals": 2,
+            "nab_low_fp": 12.0,
             "target_gap": 0.10,
         },
     ]
@@ -193,6 +214,13 @@ def test_theta_sweep_summary_statistics_and_metric_directions():
     assert summary.loc["recall", "direction"] == "higher_is_better"
     assert summary.loc["recall", "best_theta"] == pytest.approx(0.2)
     assert summary.loc["coverage", "best_theta"] == pytest.approx(0.3)
+    assert summary.loc["ttd_mean_min", "direction"] == "higher_is_better"
+    assert summary.loc["ttd_mean_min", "best_theta"] == pytest.approx(0.2)
+    assert summary.loc["ttd_std_min", "direction"] == "lower_is_better"
+    assert summary.loc["ttd_std_min", "best_theta"] == pytest.approx(0.3)
+    assert summary.loc["mtia_mean_min", "direction"] == "lower_is_better"
+    assert summary.loc["far_fp_intervals", "direction"] == "lower_is_better"
+    assert summary.loc["nab_low_fp", "direction"] == "higher_is_better"
     assert summary.loc["target_gap", "best_theta"] == pytest.approx(0.3)
 
 
@@ -200,18 +228,83 @@ def test_theta_sweep_export_writes_summary_and_preserves_raw_sweep(monkeypatch, 
     def fake_pred_output_path(path, mode, detector):
         return str(tmp_path / path)
 
+    def fake_event_results(**_kwargs):
+        return {
+            "event_scores": {
+                "precision": 0.5,
+                "recall": 0.5,
+                "f1": 0.5,
+                "tp": 1,
+                "fp": 1,
+                "fn": 1,
+            },
+            "ttd": {
+                "mean_ttd": 42.0,
+                "median_ttd": 45.0,
+                "std_ttd": 3.0,
+                "min_ttd": 30.0,
+                "max_ttd": 50.0,
+                "detected_events": 2,
+                "missed_events": 1,
+            },
+            "lead_time_distribution": {
+                "bins": [0, 30, 60],
+                "counts": [1, 2],
+            },
+            "coverage": {
+                "alarm_coverage_percent": 10.0,
+                "alarm_points": 4,
+                "total_points": 40,
+            },
+            "far": {
+                "far_per_day": 0.5,
+                "far_per_week": 2.0,
+                "fp_intervals": 3,
+                "total_alarm_intervals": 5,
+            },
+            "first_alarm_accuracy": {
+                "first_alarm_accuracy": 0.25,
+                "tp_events": 4,
+                "first_alarm_in_window": 1,
+            },
+            "mtia": {
+                "mtia_minutes": 11.0,
+                "median_minutes": 10.0,
+                "std_minutes": 2.0,
+                "min_minutes": 8.0,
+                "max_minutes": 15.0,
+                "num_intervals": 5,
+            },
+            "nab": {
+                "standard": {
+                    "nab_score_normalized": 30.0,
+                    "nab_score_raw": 1.5,
+                    "num_fp": 3,
+                },
+                "low_fp": {
+                    "nab_score_normalized": 25.0,
+                    "nab_score_raw": 1.0,
+                    "num_fp": 3,
+                },
+                "low_fn": {
+                    "nab_score_normalized": 35.0,
+                    "nab_score_raw": 2.0,
+                    "num_fp": 3,
+                },
+            },
+            "pr_leadtime": {
+                "lead_times": [30, 60],
+                "precision": [0.20, 0.40],
+                "recall": [0.30, 0.50],
+                "f1": [0.24, 0.44],
+                "tp": [1, 2],
+                "fp": [4, 3],
+                "fn": [5, 4],
+            },
+        }
+
     monkeypatch.setattr(metropt_main, "_pred_output_path", fake_pred_output_path)
-    monkeypatch.setattr(
-        metropt_main,
-        "evaluate_maintenance_prediction",
-        lambda **_kwargs: {
-            "event_scores": {"precision": 0.5, "recall": 0.5, "f1": 0.5, "tp": 1, "fp": 1, "fn": 1},
-            "coverage": {"alarm_coverage_percent": 10.0},
-            "far": {"far_per_week": 2.0},
-            "first_alarm_accuracy": {"first_alarm_accuracy": 0.25},
-            "nab": {"standard": {"nab_score_normalized": 30.0}},
-        },
-    )
+    monkeypatch.setattr(metropt_main, "evaluate_maintenance_prediction", fake_event_results)
 
     idx = pd.date_range("2020-01-01", periods=4, freq="1min")
     maintenance_risk = pd.Series([0.1, 0.4, 0.7, 0.9], index=idx)
@@ -233,11 +326,15 @@ def test_theta_sweep_export_writes_summary_and_preserves_raw_sweep(monkeypatch, 
 
     sweep_path = tmp_path / "theta_sweep_maintenance_risk.csv"
     summary_path = tmp_path / "theta_sweep_summary.csv"
+    pr_path = tmp_path / "theta_sweep_pr_vs_lead_time.csv"
+    ttd_distribution_path = tmp_path / "theta_sweep_ttd_distribution.csv"
     assert sweep_path.exists()
     assert summary_path.exists()
+    assert pr_path.exists()
+    assert ttd_distribution_path.exists()
 
     sweep = pd.read_csv(sweep_path)
-    assert list(sweep.columns) == [
+    expected_legacy_columns = [
         "maintenance_risk_theta",
         "tp",
         "fp",
@@ -252,13 +349,177 @@ def test_theta_sweep_export_writes_summary_and_preserves_raw_sweep(monkeypatch, 
         "target_gap",
         "selection_mode",
     ]
+    assert list(sweep.columns[: len(expected_legacy_columns)]) == expected_legacy_columns
+    for column in [
+        "ttd_mean_min",
+        "ttd_median_min",
+        "ttd_std_min",
+        "ttd_min_min",
+        "ttd_max_min",
+        "ttd_detected_events",
+        "ttd_missed_events",
+        "faa_tp_events",
+        "faa_first_alarm_in_window",
+        "coverage_percent",
+        "alarm_points",
+        "total_points",
+        "mtia_mean_min",
+        "mtia_median_min",
+        "mtia_std_min",
+        "mtia_min_min",
+        "mtia_max_min",
+        "mtia_num_intervals",
+        "far_per_day",
+        "far_fp_intervals",
+        "far_total_alarm_intervals",
+        "nab_standard_raw",
+        "nab_standard_num_fp",
+        "nab_low_fp",
+        "nab_low_fp_raw",
+        "nab_low_fp_num_fp",
+        "nab_low_fn",
+        "nab_low_fn_raw",
+        "nab_low_fn_num_fp",
+    ]:
+        assert column in sweep.columns
     assert len(sweep) == 2
+    assert sweep.loc[0, "ttd_mean_min"] == pytest.approx(42.0)
+    assert sweep.loc[0, "coverage_percent"] == pytest.approx(10.0)
+    assert sweep.loc[0, "far_per_day"] == pytest.approx(0.5)
+    assert sweep.loc[0, "nab_low_fn"] == pytest.approx(35.0)
+
+    pr = pd.read_csv(pr_path)
+    assert list(pr.columns) == [
+        "maintenance_risk_theta",
+        "lead_time_min",
+        "precision",
+        "recall",
+        "f1",
+        "tp",
+        "fp",
+        "fn",
+        "selection_mode",
+    ]
+    assert len(pr) == 4
+    assert set(pr["maintenance_risk_theta"]) == {0.2, 0.6}
+
+    ttd_distribution = pd.read_csv(ttd_distribution_path)
+    assert list(ttd_distribution.columns) == [
+        "maintenance_risk_theta",
+        "bin_start_min",
+        "bin_end_min",
+        "count",
+        "selection_mode",
+    ]
+    assert len(ttd_distribution) == 4
+    assert set(ttd_distribution["bin_start_min"]) == {0, 30}
 
     summary = pd.read_csv(summary_path).set_index("metric")
     assert "f1" in summary.index
     assert "coverage" in summary.index
+    assert "ttd_mean_min" in summary.index
+    assert "mtia_mean_min" in summary.index
+    assert "nab_low_fn" in summary.index
     assert summary.loc["f1", "best_theta"] == pytest.approx(0.6)
     assert summary.loc["coverage", "best_theta"] == pytest.approx(0.6)
+    assert summary.loc["ttd_mean_min", "direction"] == "higher_is_better"
+    assert summary.loc["mtia_mean_min", "direction"] == "lower_is_better"
+
+
+def test_theta_sweep_export_handles_empty_nested_event_metrics(monkeypatch, tmp_path):
+    def fake_pred_output_path(path, mode, detector):
+        return str(tmp_path / path)
+
+    monkeypatch.setattr(metropt_main, "_pred_output_path", fake_pred_output_path)
+    monkeypatch.setattr(
+        metropt_main,
+        "evaluate_maintenance_prediction",
+        lambda **_kwargs: {
+            "event_scores": {
+                "precision": 0.0,
+                "recall": 0.0,
+                "f1": 0.0,
+                "tp": 0,
+                "fp": 0,
+                "fn": 1,
+            },
+            "ttd": {
+                "mean_ttd": None,
+                "median_ttd": None,
+                "std_ttd": None,
+                "min_ttd": None,
+                "max_ttd": None,
+                "detected_events": 0,
+                "missed_events": 1,
+            },
+            "lead_time_distribution": {"bins": [0, 30], "counts": []},
+            "coverage": {"alarm_coverage_percent": 0.0, "alarm_points": 0, "total_points": 4},
+            "far": {
+                "far_per_day": None,
+                "far_per_week": None,
+                "fp_intervals": 0,
+                "total_alarm_intervals": 0,
+            },
+            "first_alarm_accuracy": {
+                "first_alarm_accuracy": None,
+                "tp_events": 0,
+                "first_alarm_in_window": 0,
+            },
+            "mtia": {
+                "mtia_minutes": None,
+                "median_minutes": None,
+                "std_minutes": None,
+                "min_minutes": None,
+                "max_minutes": None,
+                "num_intervals": 0,
+            },
+            "nab": {},
+            "pr_leadtime": {
+                "lead_times": [],
+                "precision": [],
+                "recall": [],
+                "f1": [],
+                "tp": [],
+                "fp": [],
+                "fn": [],
+            },
+        },
+    )
+
+    idx = pd.date_range("2020-01-01", periods=4, freq="1min")
+    maintenance_risk = pd.Series([0.0, 0.0, 0.0, 0.0], index=idx)
+    eval_mask = pd.Series([True] * len(idx), index=idx)
+
+    metropt_main._save_maintenance_risk_theta_sweep(
+        maintenance_risk=maintenance_risk,
+        maint_windows=[(idx[2], idx[3])],
+        eval_mask=eval_mask,
+        risk_results=[
+            {
+                "threshold": 0.6,
+                "tp": 0,
+                "fp": 0,
+                "fn": 1,
+                "precision": 0.0,
+                "recall": 0.0,
+                "f1": 0.0,
+                "coverage": 0.0,
+                "target_gap": 0.6,
+            }
+        ],
+        best_stats={"threshold": 0.6, "selection_mode": "fallback"},
+        mode="single",
+        detector="iforest",
+    )
+
+    sweep = pd.read_csv(tmp_path / "theta_sweep_maintenance_risk.csv")
+    assert pd.isna(sweep.loc[0, "ttd_mean_min"])
+    assert pd.isna(sweep.loc[0, "ttd_median_min"])
+    assert sweep.loc[0, "ttd_detected_events"] == 0
+    assert sweep.loc[0, "ttd_missed_events"] == 1
+    assert pd.isna(sweep.loc[0, "mtia_mean_min"])
+    assert not (tmp_path / "theta_sweep_pr_vs_lead_time.csv").exists()
+    assert not (tmp_path / "theta_sweep_ttd_distribution.csv").exists()
 
 
 def test_resolve_manifest_cycle_trained_and_alias(tmp_path: Path):

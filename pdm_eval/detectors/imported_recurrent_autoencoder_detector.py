@@ -464,7 +464,7 @@ class ImportedRecurrentAutoencoderDetector(BaseDetector):
         import torch
         from torch.utils.data import DataLoader
 
-        from dataloaders.metropt_dataloader import MetroPTSequenceDataset
+        from pdm_eval.dataloaders.metropt_dataloader import MetroPTSequenceDataset
 
         if X is None or X.shape[0] < 2:
             raise ValueError("Need at least 2 samples for scoring.")

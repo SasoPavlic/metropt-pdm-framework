@@ -26,8 +26,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from data_utils import build_operation_phase, load_csv, parse_maintenance_windows
-from detectors.utils import time_based_train_mask
+from pdm_eval.data.preprocessing import (
+    build_operation_phase,
+    load_csv,
+    parse_maintenance_windows,
+)
+from pdm_eval.detectors.utils import time_based_train_mask
 
 # -----------------------------
 # Defaults (fallbacks)

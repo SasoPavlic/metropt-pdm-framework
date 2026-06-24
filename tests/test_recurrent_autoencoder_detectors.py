@@ -190,6 +190,43 @@ def test_imported_per_maint_mode_uses_flag_not_detector_type(monkeypatch, tmp_pa
     )
 
 
+def test_imported_manifest_contract_mismatch_fails_before_feature_build(monkeypatch, tmp_path):
+    manifest_path = tmp_path / "cycle_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "2.0",
+                "contract_version": "2.0",
+                "cycles": {
+                    "00": {
+                        "status": "trained",
+                        "contract_version": "2.0",
+                        "cycle_id": 0,
+                        "model_path": "cycle_00/model.pt",
+                        "meta_path": "cycle_00/model_meta.json",
+                        "scaler_path": "cycle_00/scaler.joblib",
+                        "rolling_window": "60s",
+                        "seq_len": 200,
+                        "stride": 1,
+                        "train_minutes": 43200,
+                        "post_train_minutes": 600,
+                        "pre_maint_minutes": 120,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(metropt_main, "PER_MAINT_USE_IMPORTED_MODELS", True)
+    monkeypatch.setattr(metropt_main, "PER_MAINT_MODEL_MANIFEST_PATH", str(manifest_path))
+    monkeypatch.setattr(metropt_main, "TRAIN_FRAC", 10080)
+    monkeypatch.setattr(metropt_main, "POST_MAINT_TRAIN_MINUTES", 600)
+
+    with pytest.raises(ValueError, match="train_minutes"):
+        metropt_main._validate_runtime_configuration("per_maint")
+
+
 @pytest.mark.parametrize("detector_type", ["recurrent-vae", "recurrent-sae"])
 def test_recurrent_detectors_are_single_mode_only_for_local_training(monkeypatch, detector_type):
     monkeypatch.setattr(metropt_main, "PER_MAINT_USE_IMPORTED_MODELS", False)

@@ -272,6 +272,46 @@ def _config_error(message: str, hints: Optional[List[str]] = None) -> None:
     raise ValueError(message)
 
 
+def _validate_imported_manifest_runtime_contract(manifest: dict) -> None:
+    """Fail early when runtime split/feature constants do not match imported artifacts."""
+    cycles = manifest.get("cycles") or {}
+    trained_entries = [
+        entry
+        for entry in cycles.values()
+        if isinstance(entry, dict) and str(entry.get("status", "")).strip().lower() == "trained"
+    ]
+    if not trained_entries:
+        return
+
+    checks = {
+        "rolling_window": ROLLING_WINDOW,
+        "seq_len": REC_SEQUENCE_LEN,
+        "stride": REC_STRIDE,
+        "train_minutes": TRAIN_FRAC,
+        "post_train_minutes": POST_MAINT_TRAIN_MINUTES,
+        "pre_maint_minutes": PRE_MAINTENANCE_MINUTES,
+    }
+    for entry in trained_entries:
+        cycle = entry.get("cycle_id")
+        for key, expected in checks.items():
+            observed = entry.get(key)
+            if observed is None:
+                continue
+            if isinstance(expected, (int, float)) or isinstance(observed, (int, float)):
+                matches = float(expected) == float(observed)
+            else:
+                matches = str(expected) == str(observed)
+            if not matches:
+                _config_error(
+                    f"Imported manifest contract mismatch for {key}: "
+                    f"runtime={expected!r}, artifact={observed!r}, cycle={cycle!r}.",
+                    [
+                        "Align pdm_eval.pipeline runtime constants with the NiaNetVAE config used to export artifacts.",
+                        "For the current warmstart artifacts, use TRAIN_FRAC=43200 and POST_MAINT_TRAIN_MINUTES=600.",
+                    ],
+                )
+
+
 def _validate_runtime_configuration(mode: str) -> None:
     mode_norm = _normalize_mode(mode)
     detector = str(DETECTOR_TYPE).strip().lower()
@@ -319,7 +359,8 @@ def _validate_runtime_configuration(mode: str) -> None:
                 f"Manifest path does not exist: {manifest_path}",
                 ["Verify path and that cycle artifacts + cycle_manifest.json were copied locally."],
             )
-        _load_cycle_manifest(str(manifest_path))
+        manifest_payload, _manifest_dir = _load_cycle_manifest(str(manifest_path))
+        _validate_imported_manifest_runtime_contract(manifest_payload)
         return
 
     local_per_maint_detectors = {"iforest", "isolation_forest", "isolationforest"}
@@ -394,7 +435,7 @@ EXPERIMENT_MODE: str = "per_maint"
 
 # Pretrained per-maint model handoff (manifest-driven)
 PER_MAINT_USE_IMPORTED_MODELS: bool = True
-PER_MAINT_MODEL_MANIFEST_PATH: Optional[str] = r'C:\Users\sasop\CodexProjects\nianet\NiaNetVAE\logs\per_maint_vae_finetune\MetroPT\cycle_manifest.json'
+PER_MAINT_MODEL_MANIFEST_PATH: Optional[str] = r'C:\Users\sasop\CodexProjects\nianet\NiaNetVAE\logs\per_maint_vae_finetune_alarm_burden\MetroPT\cycle_manifest.json'
 PER_MAINT_MODEL_STRICT: bool = True
 
 # Detector backend for local training ("iforest", "recurrent-vae", "recurrent-sae")
@@ -456,7 +497,7 @@ elif is_recurrent_sae_type(DETECTOR_TYPE):
 # Rolling window for feature aggregation (e.g., '600s' = 10 minutes).
 ROLLING_WINDOW: str = "60s"
 # Duration (minutes) of the initial training window (chronological from the start).
-TRAIN_FRAC: float = 10080
+TRAIN_FRAC: float = 43200
 # --- Modeling / scoring ---
 # Rolling risk window (minutes).
 RISK_WINDOW_MINUTES: int = 120
@@ -479,7 +520,7 @@ LEAD_STEP_MINUTES: int = 30
 # clipped so it does not intrude into the next maintenance window. The same
 # time mask is excluded from point-wise evaluation in the single-model regime
 # for fair comparison.
-POST_MAINT_TRAIN_MINUTES: int = 540
+POST_MAINT_TRAIN_MINUTES: int = 600
 
 # --- Maintenance context / plotting ---
 # Minutes before maintenance start considered pre-maintenance (operation_phase=1)
